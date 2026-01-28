@@ -1,5 +1,5 @@
 use fhevm_engine_common::pg_pool::PostgresPoolManager;
-use fhevm_engine_common::{tenant_keys, utils::safe_serialize};
+use fhevm_engine_common::{db_keys, utils::safe_serialize};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use test_harness::instance::{DBInstance, ImportMode};
@@ -94,14 +94,13 @@ pub(crate) async fn generate_zk_pok_with_inputs(
     aux_data: &[u8],
     inputs: &[ZkInput],
 ) -> Vec<u8> {
-    let keys: Vec<tenant_keys::TfheTenantKeys> =
-        tenant_keys::query_tenant_keys(vec![1], pool, true)
-            .await
-            .map_err(|e| {
-                let e: Box<dyn std::error::Error> = e;
-                e
-            })
-            .unwrap();
+    let keys: Vec<db_keys::TfheTenantKeys> = db_keys::query_tenant_keys(vec![1], pool, true)
+        .await
+        .map_err(|e| {
+            let e: Box<dyn std::error::Error> = e;
+            e
+        })
+        .unwrap();
     let keys = &keys[0];
 
     let mut builder = tfhe::ProvenCompactCiphertextList::builder(&keys.pks);
