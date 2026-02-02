@@ -62,7 +62,7 @@ pub enum SchedulerError {
     CyclicDependence,
     DataflowGraphError,
     MissingInputs,
-    ReRandomisationError,
+    ReRandomizationError,
     SchedulerError,
 }
 
@@ -80,8 +80,8 @@ impl std::fmt::Display for SchedulerError {
             Self::MissingInputs => {
                 write!(f, "Missing inputs")
             }
-            Self::ReRandomisationError => {
-                write!(f, "Re-randomisation error")
+            Self::ReRandomizationError => {
+                write!(f, "Re-randomization error")
             }
             Self::SchedulerError => {
                 write!(f, "Generic scheduler error")

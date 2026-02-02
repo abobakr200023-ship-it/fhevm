@@ -245,7 +245,7 @@ impl<'a> Scheduler<'a> {
     }
 }
 
-fn re_randomise_transaction_inputs(
+fn re_randomize_transaction_inputs(
     inputs: &mut HashMap<Handle, Option<DFGTxInput>>,
     transaction_id: &Handle,
     component_id: usize,
@@ -270,7 +270,7 @@ fn re_randomise_transaction_inputs(
             }
             None => {
                 error!(target: "scheduler", { transaction_id = ?hex::encode(transaction_id) },
-		       "Missing transaction input while trying to re-randomise");
+		       "Missing transaction input while trying to re-randomize");
                 return Err(SchedulerError::MissingInputs.into());
             }
         }
@@ -279,18 +279,18 @@ fn re_randomise_transaction_inputs(
     for txinput in inputs.values_mut() {
         match txinput {
             Some(DFGTxInput::Value((ref mut val, true))) => {
-                val.re_randomise(&cpk, seed_gen.next_seed()?)?;
+                val.re_randomize(&cpk, seed_gen.next_seed()?)?;
             }
             Some(DFGTxInput::Value((_, false))) => {}
             Some(DFGTxInput::Compressed(_)) => {
                 error!(target: "scheduler", { transaction_id = ?hex::encode(transaction_id) },
-		       "Failed to re-randomise inputs for transaction");
-                return Err(SchedulerError::ReRandomisationError.into());
+		       "Failed to re-randomize inputs for transaction");
+                return Err(SchedulerError::ReRandomizationError.into());
             }
             None => {
                 error!(target: "scheduler", { transaction_id = ?hex::encode(transaction_id) },
-		       "Failed to re-randomise inputs for transaction");
-                return Err(SchedulerError::ReRandomisationError.into());
+		       "Failed to re-randomize inputs for transaction");
+                return Err(SchedulerError::ReRandomizationError.into());
             }
         }
     }
@@ -344,13 +344,13 @@ fn execute_partition(
             let mut s = tracer.start_with_context("rerandomise_inputs", &loop_ctx);
             telemetry::set_txn_id(&mut s, &tid);
             let started_at = std::time::Instant::now();
-            // Re-randomise inputs of the transaction - this also
+            // Re-randomize inputs of the transaction - this also
             // decompresses ciphertexts
             if let Err(e) =
-                re_randomise_transaction_inputs(tx_inputs, &tid, cid, gpu_idx, cpk.clone())
+                re_randomize_transaction_inputs(tx_inputs, &tid, cid, gpu_idx, cpk.clone())
             {
                 error!(target: "scheduler", {transaction_id = ?hex::encode(tid), error = ?e },
-		       "Error while re-randomising inputs");
+		       "Error while re-randomizing inputs");
                 for nidx in dfg.graph.node_identifiers() {
                     let Some(node) = dfg.graph.node_weight_mut(nidx) else {
                         error!(target: "scheduler", {index = ?nidx.index() }, "Wrong dataflow graph index");
@@ -359,7 +359,7 @@ fn execute_partition(
                     if node.is_allowed {
                         res.insert(
                             node.result_handle.clone(),
-                            Err(SchedulerError::ReRandomisationError.into()),
+                            Err(SchedulerError::ReRandomizationError.into()),
                         );
                     }
                 }

@@ -1,0 +1,41 @@
+#!/bin/bash
+
+# Pre-commit hook to check for typos in staged files
+# This hook is optional - it gracefully skips if typos is not installed
+
+# Check if typos is installed
+if ! command -v typos &> /dev/null; then
+  echo "Note: 'typos' is not installed. Skipping typo check."
+  echo "To enable local typo checking, install typos:"
+  echo "  cargo install typos-cli"
+  echo "  # or: brew install typos-cli"
+  exit 0
+fi
+
+# Get list of staged files (excluding deleted files)
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=d)
+
+if [ -z "$STAGED_FILES" ]; then
+  exit 0
+fi
+
+echo "Checking staged files for typos..."
+
+# Run typos on staged files only
+# shellcheck disable=SC2086
+if ! typos $STAGED_FILES; then
+  echo ""
+  echo "ERROR: Typos found in staged files."
+  echo ""
+  echo "To fix typos automatically, run:"
+  echo "  typos --write-changes"
+  echo ""
+  echo "To add a word to the whitelist, edit typos.toml under [default.extend-words]"
+  echo ""
+  echo "To bypass this check (not recommended), use:"
+  echo "  git commit --no-verify"
+  exit 1
+fi
+
+echo "No typos found."
+exit 0

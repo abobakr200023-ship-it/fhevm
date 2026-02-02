@@ -1,0 +1,16 @@
+name: common-typos-check
+
+on:
+  pull_request:
+
+permissions: {}
+
+jobs:
+  typos-check:
+    name: common-typos-check/typos (bpr)
+    permissions:
+      contents: 'read'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: crate-ci/typos@c5808522828ae9e3f706591874df64b82e60952b # v1.43.0

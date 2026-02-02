@@ -20,7 +20,7 @@ Then, zkproof-worker should notify the **transaction-sender** on the **verify_pr
 Currently, **gw-listener** uses WebSocket subscriptions via `eth_subscribe` for input proof verification events. If the connection to the node is dropped and then recovered internally in alloy-rs, the subscription of events will start from the head, possibly skipping events. This is acceptable as input proof verification would be retried by the client. Moreover, replaying
 old input verification events is unnecessary as input verification is a synchronous request/response interaction on the client side. Finally, no data on the GW will be left in an inconsistent state.
 
-A future version of the **gw-listener** could change that behaviour and could replay these events.
+A future version of the **gw-listener** could change that behavior and could replay these events.
 
 For **gw-listener** to work correctly with above in mind, the assumption is that alloy-rs would retry "indefinitely". Namely, that the following configuration options are set to high
 enough values:

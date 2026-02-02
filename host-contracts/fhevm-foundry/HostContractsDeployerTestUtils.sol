@@ -26,7 +26,7 @@ contract DeployableERC1967Proxy is ERC1967Proxy {
  *
  * Host contracts (ACL, FHEVMExecutor, KMS/Input verifiers, HCULimit, PauserSet) are deployed on mainnet
  * behind deterministic UUPS proxies anchored at addresses defined in `FHEVMHostAddresses.sol`. Rather than
- * mocking behaviours piecemeal, this helper redeploys each proxy + implementation pair exactly how production
+ * mocking behaviors piecemeal, this helper redeploys each proxy + implementation pair exactly how production
  * does:
  *  - write the appropriate empty proxy runtime to the canonical address using `deployCodeTo`;
  *  - perform the privileged upgrade calls with the expected initializer payloads;

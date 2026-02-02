@@ -190,7 +190,7 @@ impl Database {
             )
             .fetch_one(pool)
         };
-        // retry mecanism
+        // retry mechanism
         let mut retry_count = 0;
         loop {
             match query().await {
@@ -733,7 +733,7 @@ impl Database {
         block_number: u64,
         transaction_id: Option<Vec<u8>>,
     ) -> Result<bool, SqlxError> {
-        // ON CONFLIT is done on Unique constraint
+        // ON CONFLICT is done on Unique constraint
         let query = sqlx::query!(
             "INSERT INTO delegate_user_decrypt(
                 delegator, delegate, contract_address, delegation_counter, old_expiration_date, new_expiration_date, host_chain_id, block_number, block_hash, transaction_id, on_gateway, reorg_out)

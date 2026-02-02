@@ -49,18 +49,18 @@ pub(crate) static AWS_UPLOAD_FAILURE_COUNTER: LazyLock<IntCounter> = LazyLock::n
     .unwrap()
 });
 
-pub(crate) static UNCOMPLETE_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
+pub(crate) static INCOMPLETE_TASKS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
-        "coprocessor_sns_worker_uncomplete_tasks_gauge",
-        "Number of uncomplete tasks in sns-worker"
+        "coprocessor_sns_worker_incomplete_tasks_gauge",
+        "Number of incomplete tasks in sns-worker"
     )
     .unwrap()
 });
 
-pub(crate) static UNCOMPLETE_AWS_UPLOADS: LazyLock<IntGauge> = LazyLock::new(|| {
+pub(crate) static INCOMPLETE_AWS_UPLOADS: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
-        "coprocessor_sns_worker_uncomplete_aws_uploads_gauge",
-        "Number of uncomplete AWS uploads in sns-worker"
+        "coprocessor_sns_worker_incomplete_aws_uploads_gauge",
+        "Number of incomplete AWS uploads in sns-worker"
     )
     .unwrap()
 });
@@ -75,11 +75,11 @@ pub fn spawn_gauge_update_routine(period: std::time::Duration, db_pool: PgPool) 
             .await
             {
                 Ok(count) => {
-                    info!(uncomplete_tasks = %count, "Fetched uncomplete tasks count");
-                    UNCOMPLETE_TASKS.set(count);
+                    info!(incomplete_tasks = %count, "Fetched incomplete tasks count");
+                    INCOMPLETE_TASKS.set(count);
                 }
                 Err(e) => {
-                    error!(error = %e, "Failed to fetch uncomplete tasks count");
+                    error!(error = %e, "Failed to fetch incomplete tasks count");
                 }
             }
 
@@ -90,11 +90,11 @@ pub fn spawn_gauge_update_routine(period: std::time::Duration, db_pool: PgPool) 
             .await
             {
                 Ok(count) => {
-                    info!(uncomplete_aws_uploads = %count, "Fetched uncomplete AWS uploads count");
-                    UNCOMPLETE_AWS_UPLOADS.set(count);
+                    info!(incomplete_aws_uploads = %count, "Fetched incomplete AWS uploads count");
+                    INCOMPLETE_AWS_UPLOADS.set(count);
                 }
                 Err(e) => {
-                    error!(error = %e, "Failed to fetch uncomplete AWS uploads count");
+                    error!(error = %e, "Failed to fetch incomplete AWS uploads count");
                 }
             }
 

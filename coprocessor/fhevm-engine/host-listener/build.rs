@@ -17,7 +17,7 @@ fn build_contracts() {
     // Step 1: Copy ../../contracts/.env.example to ../../contracts/.env
     let env_example = Path::new("../../../host-contracts/.env.example");
     let env_dest = Path::new("../../../host-contracts/.env");
-    let artefacts = Path::new("../../../host-contracts/artifacts");
+    let artifacts = Path::new("../../../host-contracts/artifacts");
     if env_example.exists() {
         // CI build
         if !env_dest.exists() {
@@ -25,9 +25,9 @@ fn build_contracts() {
                 .expect("Failed to copy .env.example to .env");
             println!("Copied .env.example to .env");
         }
-    } else if artefacts.exists() {
+    } else if artifacts.exists() {
         // Docker build
-        println!("Assuming artefacts are up to date.");
+        println!("Assuming artifacts are up to date.");
         return;
     } else {
         panic!("Error: .env.example not found in contracts directory");
