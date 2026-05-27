@@ -2,7 +2,7 @@
 **FHEVM Coprocessor** provides the execution service for FHE computations.
 
 It includes a **Coprocessor** service [FHEVM-coprocessor](docs/getting_started/fhevm/coprocessor/coprocessor_backend.md). The Coprocessor
-itself consists of multiple microservices, e.g. for FHE compute, input verify, transaction sending, listenting to events, etc.
+itself consists of multiple microservices, e.g. for FHE compute, input verify, transaction sending, listening to events, etc.
 
 ## Main features
 
@@ -72,38 +72,24 @@ $ tfhe_worker --help
 Usage: tfhe_worker [OPTIONS]
 
 Options:
-      --run-server
-          Run the API server
       --run-bg-worker
           Run the background worker
       --generate-fhe-keys
           Generate fhe keys and exit
-      --server-maximum-ciphertexts-to-schedule <SERVER_MAXIMUM_CIPHERTEXTS_TO_SCHEDULE>
-          Server maximum ciphertexts to schedule per batch [default: 5000]
-      --server-maximum-ciphertexts-to-get <SERVER_MAXIMUM_CIPHERTEXTS_TO_GET>
-          Server maximum ciphertexts to serve on get_cihpertexts endpoint [default: 5000]
       --work-items-batch-size <WORK_ITEMS_BATCH_SIZE>
           Work items batch size [default: 10]
       --tenant-key-cache-size <TENANT_KEY_CACHE_SIZE>
           Tenant key cache size [default: 32]
-      --maximimum-compact-inputs-upload <MAXIMIMUM_COMPACT_INPUTS_UPLOAD>
-          Maximum compact inputs to upload [default: 10]
-      --maximum-handles-per-input <MAXIMUM_HANDLES_PER_INPUT>
-          Maximum compact inputs to upload [default: 255]
       --coprocessor-fhe-threads <COPROCESSOR_FHE_THREADS>
           Coprocessor FHE processing threads [default: 8]
       --tokio-threads <TOKIO_THREADS>
           Tokio Async IO threads [default: 4]
       --pg-pool-max-connections <PG_POOL_MAX_CONNECTIONS>
           Postgres pool max connections [default: 10]
-      --server-addr <SERVER_ADDR>
-          Server socket address [default: 127.0.0.1:50051]
       --metrics-addr <METRICS_ADDR>
           Prometheus metrics server address [default: 0.0.0.0:9100]
       --database-url <DATABASE_URL>
           Postgres database url. If unspecified DATABASE_URL environment variable is used
-      --coprocessor-private-key <COPROCESSOR_PRIVATE_KEY>
-          Coprocessor private key file path. Private key is in plain text 0x1234.. format [default: ./coprocessor.key]
 ```
 
 ```bash
@@ -121,6 +107,12 @@ Options:
 ```
 
 For more details on configuration, please check [Coprocessor Configuration](docs/getting_started/fhevm/coprocessor/configuration.md)
+
+For AWS RDS/PostgreSQL IAM authentication, keep `DATABASE_URL` passwordless, for example
+`postgresql://coprocessor@my-db.cluster-xyz.eu-west-2.rds.amazonaws.com:5432/coprocessor`,
+and set `DATABASE_IAM_AUTH_ENABLED=true`. `DATABASE_IAM_REGION` and
+`DATABASE_SSL_ROOT_CERT_PATH` should also be set so the runtime can sign tokens for the correct
+region and enforce `verify-full` TLS with the expected CA bundle.
 
 ##### host-listener
 
@@ -145,7 +137,7 @@ Options:
 
 ```bash
 $ gw_listener --help
-Usage: gw_listener [OPTIONS] --gw-url <GW_URL> --input-verification-address <INPUT_VERIFICATION_ADDRESS> --kms-generation-address <KMS_GENERATION_ADDRESS>
+Usage: gw_listener [OPTIONS] --gw-url <GW_URL> --input-verification-address <INPUT_VERIFICATION_ADDRESS>
 
 Options:
       --database-url <DATABASE_URL>
@@ -157,8 +149,6 @@ Options:
       --gw-url <GW_URL>
           
   -i, --input-verification-address <INPUT_VERIFICATION_ADDRESS>
-          
-      --kms-generation-address <KMS_GENERATION_ADDRESS>
           
       --error-sleep-initial-secs <ERROR_SLEEP_INITIAL_SECS>
           [default: 1]
@@ -176,16 +166,12 @@ Options:
           [default: 4s]
       --log-level <LOG_LEVEL>
           [default: INFO]
-      --host-chain-id <HOST_CHAIN_ID>
-          
       --get-logs-poll-interval <GET_LOGS_POLL_INTERVAL>
           [default: 1s]
       --get-logs-block-batch-size <GET_LOGS_BLOCK_BATCH_SIZE>
           [default: 100]
       --service-name <SERVICE_NAME>
           gw-listener service name in OTLP traces [default: gw-listener]
-      --catchup-kms-generation-from-block <CATCHUP_KMS_GENERATION_FROM_BLOCK>
-          Can be negative from last processed block
   -h, --help
           Print help
   -V, --version
@@ -196,14 +182,12 @@ Options:
 
 ```bash
 $ transaction_sender --help
-Usage: transaction_sender [OPTIONS] --input-verification-address <INPUT_VERIFICATION_ADDRESS> --ciphertext-commits-address <CIPHERTEXT_COMMITS_ADDRESS> --multichain-acl-address <MULTICHAIN_ACL_ADDRESS> --gateway-url <GATEWAY_URL>
+Usage: transaction_sender [OPTIONS] --input-verification-address <INPUT_VERIFICATION_ADDRESS> --ciphertext-commits-address <CIPHERTEXT_COMMITS_ADDRESS> --gateway-url <GATEWAY_URL>
 
 Options:
   -i, --input-verification-address <INPUT_VERIFICATION_ADDRESS>
           
   -c, --ciphertext-commits-address <CIPHERTEXT_COMMITS_ADDRESS>
-          
-  -m, --multichain-acl-address <MULTICHAIN_ACL_ADDRESS>
           
   -g, --gateway-url <GATEWAY_URL>
           
@@ -221,8 +205,6 @@ Options:
           [default: event_zkpok_computed]
       --add-ciphertexts-database-channel <ADD_CIPHERTEXTS_DATABASE_CHANNEL>
           [default: event_ciphertexts_uploaded]
-      --allow-handle-database-channel <ALLOW_HANDLE_DATABASE_CHANNEL>
-          [default: event_allowed_handle]
       --verify-proof-resp-batch-limit <VERIFY_PROOF_RESP_BATCH_LIMIT>
           [default: 128]
       --verify-proof-resp-max-retries <VERIFY_PROOF_RESP_MAX_RETRIES>
@@ -231,10 +213,6 @@ Options:
           
       --add-ciphertexts-batch-limit <ADD_CIPHERTEXTS_BATCH_LIMIT>
           [default: 10]
-      --allow-handle-batch-limit <ALLOW_HANDLE_BATCH_LIMIT>
-          [default: 10]
-      --allow-handle-max-retries <ALLOW_HANDLE_MAX_RETRIES>
-          [default: 2147483647]
       --add-ciphertexts-max-retries <ADD_CIPHERTEXTS_MAX_RETRIES>
           [default: 2147483647]
       --error-sleep-initial-secs <ERROR_SLEEP_INITIAL_SECS>
@@ -282,6 +260,55 @@ When using the `aws-kms` signer type, standard `AWS_*` environment variables are
  - **AWS_ACCESS_KEY_ID** (i.e. username)
  - **AWS_SECRET_ACCESS_KEY** (i.e. password)
  - etc.
+
+## Telemetry Style Guide (Tracing + OTEL)
+
+Use `tracing` spans as the default telemetry API.
+
+### Rules
+
+1. Use function/span names as the operation name.
+   - Do not add an `operation = "..."` span field.
+2. Do not attach high-cardinality identifiers to span attributes.
+   - Do not put `txn_id`, `transaction_hash`, or `handle` on spans.
+   - If needed for debugging, log these values in events/log lines.
+3. For async work, instrument futures with `.instrument(...)`.
+   - Do not keep `span.enter()` guards alive across `.await`.
+4. Set OTEL error status on error exits.
+   - Logging an error is not enough for trace error visibility.
+5. Keep span fields low-cardinality and useful for aggregation.
+   - Good examples: `request_id`, counts, booleans, retry bucket, chain id.
+
+### Preferred snippets
+
+```rust
+#[tracing::instrument(skip_all)]
+async fn process_proof(...) -> anyhow::Result<()> {
+    // business logic
+    Ok(())
+}
+```
+
+```rust
+use tracing::Instrument;
+
+let db_insert_span = tracing::info_span!("db_insert", request_id);
+async {
+    sqlx::query("UPDATE ...").execute(pool).await?;
+    Ok::<(), sqlx::Error>(())
+}
+.instrument(db_insert_span.clone())
+.await?;
+```
+
+```rust
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+if let Err(err) = do_work().instrument(span.clone()).await {
+    span.context().span().set_status(opentelemetry::trace::Status::error(err.to_string()));
+    return Err(err.into());
+}
+```
 
 
 ## Resources

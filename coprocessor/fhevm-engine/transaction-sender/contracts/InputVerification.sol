@@ -21,15 +21,46 @@ contract InputVerification {
      * @param signer The signer address of the coprocessor that has already rejected.
      */
     error CoprocessorAlreadyRejected(uint256 zkProofId, address txSender, address signer);
+    error VerifyProofNotRequested(uint256 zkProofId);
+    error NotCoprocessorSigner(address signerAddress);
+    error NotCoprocessorTxSender(address txSenderAddress);
+    error CoprocessorSignerDoesNotMatchTxSender(address signerAddress, address txSenderAddress);
 
     bool alreadyVerifiedRevert;
     bool alreadyRejectedRevert;
+    bool verifyProofNotRequestedRevert;
     bool otherRevert;
+    ConfigErrorMode configErrorMode;
 
-    constructor(bool _alreadyVerifiedRevert, bool _alreadyRejectedRevert, bool _otherRevert) {
+    enum ConfigErrorMode {
+        None,
+        NotCoprocessorSigner,
+        NotCoprocessorTxSender,
+        CoprocessorSignerDoesNotMatchTxSender
+    }
+
+    constructor(bool _alreadyVerifiedRevert, bool _alreadyRejectedRevert, bool _verifyProofNotRequestedRevert, bool _otherRevert) {
         alreadyVerifiedRevert = _alreadyVerifiedRevert;
         alreadyRejectedRevert = _alreadyRejectedRevert;
+        verifyProofNotRequestedRevert = _verifyProofNotRequestedRevert;
         otherRevert = _otherRevert;
+    }
+
+    function setConfigErrorMode(uint8 mode) external {
+        require(mode <= uint8(ConfigErrorMode.CoprocessorSignerDoesNotMatchTxSender), "invalid mode");
+        configErrorMode = ConfigErrorMode(mode);
+    }
+
+    function maybeRevertConfigError() internal view {
+        if (configErrorMode == ConfigErrorMode.NotCoprocessorSigner) {
+            revert NotCoprocessorSigner(msg.sender);
+        }
+        if (configErrorMode == ConfigErrorMode.NotCoprocessorTxSender) {
+            revert NotCoprocessorTxSender(msg.sender);
+        }
+        if (configErrorMode == ConfigErrorMode.CoprocessorSignerDoesNotMatchTxSender) {
+            revert CoprocessorSignerDoesNotMatchTxSender(address(0x1234), msg.sender);
+        }
     }
 
     function verifyProofResponse(
@@ -38,8 +69,13 @@ contract InputVerification {
         bytes calldata signature,
         bytes calldata /* extraData */
     ) public {
+        maybeRevertConfigError();
         if (otherRevert) {
             revert("Other revert");
+        }
+
+        if (verifyProofNotRequestedRevert) {
+            revert VerifyProofNotRequested(zkProofId);
         }
 
         if (alreadyVerifiedRevert) {
@@ -52,6 +88,12 @@ contract InputVerification {
     }
 
     function rejectProofResponse(uint256 zkProofId, bytes calldata /* extraData */) public {
+        if (configErrorMode == ConfigErrorMode.NotCoprocessorTxSender) {
+            revert NotCoprocessorTxSender(msg.sender);
+        }
+        if (verifyProofNotRequestedRevert) {
+            revert VerifyProofNotRequested(zkProofId);
+        }
         if (otherRevert) {
             revert("Other revert");
         }

@@ -1,5 +1,7 @@
 use alloy::primitives::U256;
-use fhevm_engine_common::tenant_keys::write_large_object_in_chunks;
+use fhevm_engine_common::db_keys::write_large_object_in_chunks;
+use fhevm_engine_common::tfhe_ops::current_ciphertext_version;
+use fhevm_engine_common::utils::{safe_deserialize_key, safe_serialize_key};
 use rand::distr::Alphanumeric;
 use rand::Rng;
 use sqlx::postgres::types::Oid;
@@ -32,20 +34,96 @@ pub async fn import_file_into_db(pool: &PgPool, file_path: &str) -> Result<Oid, 
     Ok(oid)
 }
 
+struct PreparedXofFixture {
+    pks: Vec<u8>,
+    sks: Vec<u8>,
+    sns_pk: Option<Vec<u8>>,
+    compressed_xof_keyset: Vec<u8>,
+}
+
+fn serialize_server_key_without_ns(server_key: tfhe::ServerKey) -> anyhow::Result<Vec<u8>> {
+    let (
+        sks,
+        kskm,
+        compression_key,
+        decompression_key,
+        noise_squashing_key,
+        noise_squashing_compression_key,
+        re_randomization_keyswitching_key,
+        oprf_key,
+        tag,
+    ) = server_key.into_raw_parts();
+
+    if noise_squashing_key.is_none() {
+        anyhow::bail!("Server key is missing the noise squashing key");
+    }
+    if noise_squashing_compression_key.is_none() {
+        anyhow::bail!("Server key is missing the noise squashing compression key");
+    }
+    if re_randomization_keyswitching_key.is_none() {
+        anyhow::bail!("Server key is missing rerandomisation keyswitching key");
+    }
+
+    Ok(safe_serialize_key(&tfhe::ServerKey::from_raw_parts(
+        sks,
+        kskm,
+        compression_key,
+        decompression_key,
+        None,
+        None,
+        re_randomization_keyswitching_key,
+        oprf_key,
+        tag,
+    )))
+}
+
+/// Loads a real kms-core-shaped `CompressedXofKeySet` fixture and derives the
+/// legacy columns from the same full-keyset decompression path used in
+/// production.
+async fn prepare_xof_fixture_for_db(
+    compressed_xof_keyset_path: &str,
+    with_sns_pk: bool,
+) -> anyhow::Result<PreparedXofFixture> {
+    let compressed_xof_keyset = tokio::fs::read(compressed_xof_keyset_path)
+        .await
+        .map_err(|err| anyhow::anyhow!("can't read {compressed_xof_keyset_path}: {err}"))?;
+    let keyset_bytes = compressed_xof_keyset.clone();
+
+    let (pks, sks, sns_pk) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let keyset: tfhe::xof_key_set::CompressedXofKeySet = safe_deserialize_key(&keyset_bytes)
+            .map_err(|err| anyhow::anyhow!("deserialize CompressedXofKeySet: {err}"))?;
+        let (public_key, server_key) = keyset.decompress()?.into_raw_parts();
+        let pks = safe_serialize_key(&public_key);
+        let sns_pk = if with_sns_pk {
+            Some(safe_serialize_key(&server_key))
+        } else {
+            None
+        };
+        let sks = serialize_server_key_without_ns(server_key)?;
+        Ok((pks, sks, sns_pk))
+    })
+    .await??;
+
+    Ok(PreparedXofFixture {
+        pks,
+        sks,
+        sns_pk,
+        compressed_xof_keyset,
+    })
+}
+
 pub async fn insert_ciphertext64(
     pool: &sqlx::PgPool,
-    tenant_id: i32,
     handle: &Vec<u8>,
     ciphertext: &Vec<u8>,
 ) -> anyhow::Result<()> {
     let _ = query!(
-        "INSERT INTO ciphertexts(tenant_id, handle, ciphertext, ciphertext_version, ciphertext_type) 
-         VALUES ($1, $2, $3, $4, $5)
+        "INSERT INTO ciphertexts(handle, ciphertext, ciphertext_version, ciphertext_type) 
+         VALUES ($1, $2, $3, $4)
          ON CONFLICT DO NOTHING;",
-         tenant_id,
         handle,
         ciphertext,
-        0,
+        current_ciphertext_version(),
         0,
     )
     .execute(pool)
@@ -57,14 +135,14 @@ pub async fn insert_ciphertext64(
 
 pub async fn insert_into_pbs_computations(
     pool: &sqlx::PgPool,
-    tenant_id: i32,
+    host_chain_id: i64,
     handle: &Vec<u8>,
 ) -> Result<(), anyhow::Error> {
     let _ = query!(
-        "INSERT INTO pbs_computations(tenant_id, handle) VALUES($1, $2) 
+        "INSERT INTO pbs_computations(handle, host_chain_id) VALUES($1, $2) 
              ON CONFLICT DO NOTHING;",
-        tenant_id,
         handle,
+        host_chain_id,
     )
     .execute(pool)
     .await
@@ -75,7 +153,8 @@ pub async fn insert_into_pbs_computations(
 
 pub async fn insert_ciphertext_digest(
     pool: &PgPool,
-    tenant_id: i32,
+    host_chain_id: i64,
+    key_id_gw: [u8; 32],
     handle: &[u8; 32],
     ciphertext: &[u8],
     ciphertext128: &[u8],
@@ -83,10 +162,11 @@ pub async fn insert_ciphertext_digest(
 ) -> Result<(), sqlx::Error> {
     sqlx::query!(
         r#"
-        INSERT INTO ciphertext_digest (tenant_id, handle, ciphertext, ciphertext128, txn_limited_retries_count)
-        VALUES ($1, $2, $3, $4, $5)
+        INSERT INTO ciphertext_digest (host_chain_id, key_id_gw, handle, ciphertext, ciphertext128, txn_limited_retries_count)
+        VALUES ($1, $2, $3, $4, $5, $6)
         "#,
-        tenant_id,
+        host_chain_id,
+        &key_id_gw,
         handle,
         ciphertext,
         ciphertext128,
@@ -101,14 +181,12 @@ pub async fn insert_ciphertext_digest(
 // Poll database until ciphertext128 of the specified handle is available
 pub async fn wait_for_ciphertext(
     pool: &sqlx::PgPool,
-    tenant_id: i32,
     handle: &Vec<u8>,
     retries: u64,
 ) -> anyhow::Result<Vec<u8>> {
     for retry in 0..retries {
         let record = sqlx::query!(
-            "SELECT ciphertext FROM ciphertexts128 WHERE tenant_id = $1 AND handle = $2",
-            tenant_id,
+            "SELECT ciphertext FROM ciphertexts128 WHERE handle = $1",
             handle
         )
         .fetch_one(pool)
@@ -129,69 +207,98 @@ pub async fn wait_for_ciphertext(
     Err(sqlx::Error::RowNotFound.into())
 }
 
-/// Inserts a new tenant into the database with the specified ACL contract address
+/// Inserts new set of keys into the database with the specified ACL contract address.
 ///
 /// # Arguments
 /// * `pool` - The database connection pool
 /// * `with_sns_pk` - Enables the importing of SNS sks key which usually is 1.5GB in size
-pub async fn setup_test_user(
+pub async fn setup_test_key(
     pool: &sqlx::PgPool,
     with_sns_pk: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let gpu_enabled = cfg!(feature = "gpu");
-    info!(gpu_enabled, "Setting up test user...");
+    info!(gpu_enabled, "Setting up test key...");
 
-    let (sks, cks, pks, pp, sns_pk) = if !cfg!(feature = "gpu") {
-        (
-            "../fhevm-keys/sks",
-            "../fhevm-keys/cks",
-            "../fhevm-keys/pks",
-            "../fhevm-keys/pp",
-            "../fhevm-keys/sns_pk",
-        )
-    } else {
-        (
-            "../fhevm-keys/gpu-csks",
-            "../fhevm-keys/gpu-cks",
-            "../fhevm-keys/gpu-pks",
-            "../fhevm-keys/gpu-pp",
-            "../fhevm-keys/gpu-csks",
-        )
-    };
-    let sks = tokio::fs::read(sks).await.expect("can't read sks key");
-    let pks = tokio::fs::read(pks).await.expect("can't read pks key");
-    let cks = tokio::fs::read(cks).await.expect("can't read cks key");
-    let public_params = tokio::fs::read(pp).await.expect("can't read public params");
+    // Same XofKeySet fixture for CPU and GPU: keygen parameters are
+    // identical between the two builds, and the production read path
+    // (kxs.decompress() / kxs.decompress_to_gpu()) consumes the same
+    // raw blob.
+    let prepared_xof = prepare_xof_fixture_for_db("../fhevm-keys/xof-keyset", with_sns_pk).await?;
+    let cks = tokio::fs::read("../fhevm-keys/xof-cks")
+        .await
+        .expect("can't read cks key");
+    let public_params = tokio::fs::read("../fhevm-keys/pp")
+        .await
+        .expect("can't read public params");
 
-    let sns_pk_oid = if with_sns_pk {
-        import_file_into_db(pool, sns_pk).await?
+    let sns_pk_oid = if let Some(sns_pk) = prepared_xof.sns_pk.as_deref() {
+        Some(write_large_object_in_chunks(pool, sns_pk, 16 * 1024).await?)
     } else {
-        Oid::default()
+        None
     };
 
     info!("Uploaded sns_pk with Oid: {:?}", sns_pk_oid);
+    info!(
+        "Set compressed_xof_keyset BYTEA len: {:?}",
+        Some(prepared_xof.compressed_xof_keyset.len())
+    );
+
+    let key_id: i32 = rand::rng().random_range(1..10000);
+    let key_id = U256::from(key_id).to_be_bytes::<32>();
+
+    let key_id_gw: i32 = rand::rng().random_range(1..10000);
+    let key_id_gw = U256::from(key_id_gw).to_be_bytes::<32>();
 
     sqlx::query!(
         "
-            INSERT INTO tenants(tenant_api_key, chain_id, acl_contract_address, verifying_contract_address, pks_key, sks_key, public_params, cks_key, sns_pk)
+            INSERT INTO keys(
+                key_id, key_id_gw, pks_key, sks_key, cks_key, sns_pk,
+                compressed_xof_keyset
+            )
             VALUES (
-                'a1503fb6-d79b-4e9e-826d-44cf262f3e05',
-                12345,
                 $1,
-                '0x69dE3158643e738a0724418b21a35FAA20CBb1c5',
                 $2,
                 $3,
                 $4,
                 $5,
-                $6
+                $6,
+                $7
             )
         ",
-        ACL_CONTRACT_ADDR.to_string(),
-        &pks,
-        &sks,
-        &public_params,
+        &key_id,
+        &key_id_gw,
+        &prepared_xof.pks,
+        &prepared_xof.sks,
         &cks,
-        sns_pk_oid
+        sns_pk_oid,
+        prepared_xof.compressed_xof_keyset.as_slice(),
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query!(
+        "
+            INSERT INTO crs(crs_id, crs)
+            VALUES (
+                ''::BYTEA,
+                $1
+            )
+        ",
+        &public_params
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query!(
+        "
+            INSERT INTO host_chains (chain_id, name, acl_contract_address)
+            VALUES (
+                12345,
+                'test chain',
+                $1
+            )
+        ",
+        ACL_CONTRACT_ADDR
     )
     .execute(pool)
     .await?;
@@ -199,9 +306,12 @@ pub async fn setup_test_user(
     Ok(())
 }
 
-pub async fn insert_random_tenant(pool: &PgPool) -> Result<i32, sqlx::Error> {
-    let chain_id: i64 = rand::rng().random_range(1..10000);
+pub async fn insert_random_keys_and_host_chain(
+    pool: &PgPool,
+) -> Result<(i64, [u8; 32]), sqlx::Error> {
+    let host_chain_id: i64 = rand::rng().random_range(1..10000);
     let key_id_i32: i32 = rand::rng().random_range(1..10000);
+    let key_id_gw_i32: i32 = rand::rng().random_range(1..10000);
 
     let verifying_contract_address: String = rand::rng()
         .sample_iter(&Alphanumeric)
@@ -216,35 +326,80 @@ pub async fn insert_random_tenant(pool: &PgPool) -> Result<i32, sqlx::Error> {
         .collect();
 
     info!(
-        "Dummy tenant info chain_id: {}, key_id: {}, acl_addr: {}, verify_addr: {}",
-        chain_id, key_id_i32, acl_contract_address, verifying_contract_address
+        "Dummy data host_chain_id: {}, key_id: {}, acl_addr: {}, verify_addr: {}",
+        host_chain_id, key_id_i32, acl_contract_address, verifying_contract_address
     );
 
     let pks_key: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let sks_key: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let public_params: Vec<u8> = (0..64).map(|_| rand::random::<u8>()).collect();
     let key_id = U256::from(key_id_i32).to_be_bytes::<32>();
+    let key_id_gw = U256::from(key_id_gw_i32).to_be_bytes::<32>();
 
-    let row = sqlx::query!(
-        r#"
-        INSERT INTO tenants (chain_id, key_id, verifying_contract_address, acl_contract_address, 
-                            pks_key, sks_key, public_params)
-        VALUES ($1, $2, $3, $4, $5, $6, $7)
-        RETURNING tenant_id, tenant_api_key, chain_id, verifying_contract_address, 
-                  acl_contract_address, pks_key, sks_key, public_params, key_id
-        "#,
-        chain_id,
+    sqlx::query!(
+        "
+            INSERT INTO keys(key_id, key_id_gw, pks_key, sks_key)
+            VALUES (
+                $1,
+                $2,
+                $3,
+                $4
+            )
+        ",
         &key_id,
-        verifying_contract_address,
-        acl_contract_address,
-        pks_key,
-        sks_key,
-        public_params
+        &key_id_gw,
+        &pks_key,
+        &sks_key,
     )
-    .fetch_one(pool)
+    .execute(pool)
     .await?;
 
-    Ok(row.tenant_id)
+    sqlx::query!(
+        "
+            INSERT INTO crs(crs_id, crs)
+            VALUES (
+                ''::BYTEA,
+                $1
+            )
+        ",
+        &public_params
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query!(
+        "
+            INSERT INTO host_chains (chain_id, name, acl_contract_address)
+            VALUES (
+                $1,
+                'test chain',
+                $2
+            )
+        ",
+        host_chain_id,
+        acl_contract_address
+    )
+    .execute(pool)
+    .await?;
+
+    Ok((host_chain_id, key_id))
+}
+
+/// Returns the revert_coprocessor_db_state SQL script with psql variables substituted.
+/// This allows running the production script via sqlx without a psql layer.
+pub fn revert_coprocessor_db_state_sql(chain_id: i64, to_block_number: i64) -> String {
+    let raw = include_str!("../../db-migration/db-scripts/revert_coprocessor_db_state.sql");
+    let mut sql = String::new();
+    for line in raw.lines() {
+        if line.starts_with("\\set ") {
+            continue;
+        }
+        sql.push_str(line);
+        sql.push('\n');
+    }
+    sql = sql.replace(":'chain_id'", &chain_id.to_string());
+    sql = sql.replace(":'to_block_number'", &to_block_number.to_string());
+    sql
 }
 
 pub async fn truncate_tables(db_pool: &sqlx::PgPool, tables: Vec<&str>) -> Result<(), sqlx::Error> {

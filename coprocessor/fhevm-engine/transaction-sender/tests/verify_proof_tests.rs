@@ -1,11 +1,10 @@
 use alloy::network::TxSigner;
 use alloy::primitives::FixedBytes;
 use alloy::primitives::U256;
-use alloy::providers::WsConnect;
-use alloy::signers::local::PrivateKeySigner;
+use alloy::providers::{Provider, WsConnect};
 use alloy::{providers::ProviderBuilder, sol};
 use common::SignerType;
-use common::{CiphertextCommits, InputVerification, TestEnvironment};
+use common::{is_coprocessor_config_error, CiphertextCommits, InputVerification, TestEnvironment};
 use futures_util::StreamExt;
 use futures_util::TryStreamExt;
 use rand::random;
@@ -15,7 +14,9 @@ use sqlx::{Postgres, QueryBuilder};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::sleep;
-use transaction_sender::{FillersWithoutNonceManagement, NonceManagedProvider, TransactionSender};
+use transaction_sender::{
+    ConfigSettings, FillersWithoutNonceManagement, NonceManagedProvider, TransactionSender,
+};
 mod common;
 
 sol! {
@@ -48,11 +49,13 @@ async fn verify_proof_response_success(#[case] signer_type: SignerType) -> anyho
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = false;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -63,10 +66,8 @@ async fn verify_proof_response_success(#[case] signer_type: SignerType) -> anyho
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -166,11 +167,13 @@ async fn verify_proof_response_empty_handles_success(
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = false;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -181,10 +184,8 @@ async fn verify_proof_response_empty_handles_success(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -287,11 +288,13 @@ async fn verify_proof_response_concurrent_success(
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = false;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -302,10 +305,8 @@ async fn verify_proof_response_concurrent_success(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -406,11 +407,13 @@ async fn reject_proof_response_success(#[case] signer_type: SignerType) -> anyho
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = false;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -421,10 +424,8 @@ async fn reject_proof_response_success(#[case] signer_type: SignerType) -> anyho
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -518,11 +519,13 @@ async fn verify_proof_response_reversal_already_verified(
     );
     let already_verified_revert = true;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = false;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -533,10 +536,8 @@ async fn verify_proof_response_reversal_already_verified(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -604,6 +605,213 @@ async fn verify_proof_response_reversal_already_verified(
 #[case::aws_kms(SignerType::AwsKms)]
 #[tokio::test]
 #[serial(db)]
+async fn verify_proof_response_reversal_not_requested(
+    #[case] signer_type: SignerType,
+) -> anyhow::Result<()> {
+    let env = TestEnvironment::new(signer_type).await?;
+    let provider_deploy = ProviderBuilder::new()
+        .wallet(env.wallet.clone())
+        .connect_ws(WsConnect::new(env.ws_endpoint_url()))
+        .await?;
+    let provider = NonceManagedProvider::new(
+        ProviderBuilder::default()
+            .filler(FillersWithoutNonceManagement::default())
+            .wallet(env.wallet.clone())
+            .connect_ws(WsConnect::new(env.ws_endpoint_url()))
+            .await?,
+        Some(env.wallet.default_signer().address()),
+    );
+    let already_verified_revert = false;
+    let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = true;
+    let other_revert = false;
+    let input_verification = InputVerification::deploy(
+        &provider_deploy,
+        already_verified_revert,
+        already_rejected_revert,
+        verify_proof_not_requested_revert,
+        other_revert,
+    )
+    .await?;
+    let already_added_revert = false;
+    let ciphertext_commits =
+        CiphertextCommits::deploy(&provider_deploy, already_added_revert).await?;
+    let txn_sender = TransactionSender::new(
+        env.db_pool.clone(),
+        *input_verification.address(),
+        *ciphertext_commits.address(),
+        env.signer.clone(),
+        provider.clone(),
+        env.cancel_token.clone(),
+        env.conf.clone(),
+        None,
+    )
+    .await?;
+
+    let proof_id: u32 = random();
+
+    let run_handle = tokio::spawn(async move { txn_sender.run().await });
+
+    // Record initial transaction count.
+    let initial_tx_count = provider
+        .get_transaction_count(TxSigner::address(&env.signer))
+        .await?;
+
+    // Insert a proof into the database and notify the sender.
+    sqlx::query!(
+        "WITH ins AS (
+            INSERT INTO verify_proofs (zk_proof_id, chain_id, contract_address, user_address, handles, verified)
+            VALUES ($1, $2, $3, $4, $5, true)
+        )
+        SELECT pg_notify($6, '')",
+        proof_id as i64,
+        42,
+        env.contract_address.to_string(),
+        env.user_address.to_string(),
+        &[1u8; 64],
+        env.conf.verify_proof_resp_db_channel
+    )
+    .execute(&env.db_pool)
+    .await?;
+
+    // Make sure the proof is removed from the database.
+    loop {
+        let rows = sqlx::query!(
+            "SELECT *
+             FROM verify_proofs
+             WHERE zk_proof_id = $1",
+            proof_id as i64,
+        )
+        .fetch_all(&env.db_pool)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    // Verify that no transaction has been sent.
+    let final_tx_count = provider
+        .get_transaction_count(TxSigner::address(&env.signer))
+        .await?;
+    assert_eq!(
+        final_tx_count, initial_tx_count,
+        "Expected no new transaction to be sent"
+    );
+
+    env.cancel_token.cancel();
+    run_handle.await??;
+    Ok(())
+}
+
+#[rstest]
+#[case::private_key(SignerType::PrivateKey)]
+#[case::aws_kms(SignerType::AwsKms)]
+#[tokio::test]
+#[serial(db)]
+async fn reject_proof_response_reversal_not_requested(
+    #[case] signer_type: SignerType,
+) -> anyhow::Result<()> {
+    let env = TestEnvironment::new(signer_type).await?;
+    let provider_deploy = ProviderBuilder::new()
+        .wallet(env.wallet.clone())
+        .connect_ws(WsConnect::new(env.ws_endpoint_url()))
+        .await?;
+    let provider = NonceManagedProvider::new(
+        ProviderBuilder::default()
+            .filler(FillersWithoutNonceManagement::default())
+            .wallet(env.wallet.clone())
+            .connect_ws(WsConnect::new(env.ws_endpoint_url()))
+            .await?,
+        Some(env.wallet.default_signer().address()),
+    );
+    let already_verified_revert = false;
+    let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = true;
+    let other_revert = false;
+    let input_verification = InputVerification::deploy(
+        &provider_deploy,
+        already_verified_revert,
+        already_rejected_revert,
+        verify_proof_not_requested_revert,
+        other_revert,
+    )
+    .await?;
+    let already_added_revert = false;
+    let ciphertext_commits =
+        CiphertextCommits::deploy(&provider_deploy, already_added_revert).await?;
+    let txn_sender = TransactionSender::new(
+        env.db_pool.clone(),
+        *input_verification.address(),
+        *ciphertext_commits.address(),
+        env.signer.clone(),
+        provider.clone(),
+        env.cancel_token.clone(),
+        env.conf.clone(),
+        None,
+    )
+    .await?;
+
+    let proof_id: u32 = random();
+
+    let run_handle = tokio::spawn(async move { txn_sender.run().await });
+
+    // Record initial transaction count.
+    let initial_tx_count = provider
+        .get_transaction_count(TxSigner::address(&env.signer))
+        .await?;
+
+    sqlx::query!(
+        "WITH ins AS (
+            INSERT INTO verify_proofs (zk_proof_id, chain_id, contract_address, user_address, handles, verified)
+            VALUES ($1, $2, $3, $4, $5, false)
+        )
+        SELECT pg_notify($6, '')",
+        proof_id as i64,
+        42,
+        env.contract_address.to_string(),
+        env.user_address.to_string(),
+        &[],
+        env.conf.verify_proof_resp_db_channel
+    )
+    .execute(&env.db_pool)
+    .await?;
+
+    // Make sure the proof is removed from the database.
+    loop {
+        let rows = sqlx::query!(
+            "SELECT *
+             FROM verify_proofs
+             WHERE zk_proof_id = $1",
+            proof_id as i64,
+        )
+        .fetch_all(&env.db_pool)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+
+    // Verify that no transaction has been sent.
+    let final_tx_count = provider
+        .get_transaction_count(TxSigner::address(&env.signer))
+        .await?;
+    assert_eq!(
+        final_tx_count, initial_tx_count,
+        "Expected no new transaction to be sent"
+    );
+
+    env.cancel_token.cancel();
+    run_handle.await??;
+    Ok(())
+}
+
+#[rstest]
+#[case::private_key(SignerType::PrivateKey)]
+#[case::aws_kms(SignerType::AwsKms)]
+#[tokio::test]
+#[serial(db)]
 async fn reject_proof_response_reversal_already_rejected(
     #[case] signer_type: SignerType,
 ) -> anyhow::Result<()> {
@@ -622,11 +830,13 @@ async fn reject_proof_response_reversal_already_rejected(
     );
     let already_verified_revert = false;
     let already_rejected_revert = true;
+    let verify_proof_not_requested_revert = false;
     let other_revert = false;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -637,10 +847,8 @@ async fn reject_proof_response_reversal_already_rejected(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -725,11 +933,13 @@ async fn verify_proof_response_other_reversal(
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = true;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -741,10 +951,8 @@ async fn verify_proof_response_other_reversal(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         Some(1_000_000_000_000_000),
@@ -826,11 +1034,13 @@ async fn reject_proof_response_other_reversal(
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = true;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -842,10 +1052,8 @@ async fn reject_proof_response_other_reversal(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         Some(1_000_000_000_000_000),
@@ -923,11 +1131,13 @@ async fn verify_proof_response_other_reversal_gas_estimation(
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = true;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -938,10 +1148,8 @@ async fn verify_proof_response_other_reversal_gas_estimation(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -1023,11 +1231,13 @@ async fn reject_proof_response_other_reversal_gas_estimation(
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = true;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -1038,10 +1248,8 @@ async fn reject_proof_response_other_reversal_gas_estimation(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -1125,11 +1333,13 @@ async fn verify_proof_max_retries_remove_entry(
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = true;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -1140,10 +1350,8 @@ async fn verify_proof_max_retries_remove_entry(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -1217,11 +1425,13 @@ async fn verify_proof_max_retries_do_not_remove_entry(
     );
     let already_verified_revert = false;
     let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
     let other_revert = true;
     let input_verification = InputVerification::deploy(
         &provider_deploy,
         already_verified_revert,
         already_rejected_revert,
+        verify_proof_not_requested_revert,
         other_revert,
     )
     .await?;
@@ -1232,10 +1442,8 @@ async fn verify_proof_max_retries_do_not_remove_entry(
         env.db_pool.clone(),
         *input_verification.address(),
         *ciphertext_commits.address(),
-        PrivateKeySigner::random().address(),
         env.signer.clone(),
         provider.clone(),
-        provider.inner().clone(),
         env.cancel_token.clone(),
         env.conf.clone(),
         None,
@@ -1293,6 +1501,140 @@ async fn verify_proof_max_retries_do_not_remove_entry(
     .fetch_all(&env.db_pool)
     .await?;
     assert_eq!(rows.len(), 1);
+
+    Ok(())
+}
+
+#[rstest]
+#[case::private_key(SignerType::PrivateKey)]
+#[tokio::test]
+#[serial(db)]
+async fn stop_retrying_verify_proof_on_gw_config_error(
+    #[case] signer_type: SignerType,
+    #[values(1u8, 2, 3)] config_error_mode: u8,
+) -> anyhow::Result<()> {
+    let conf = ConfigSettings {
+        verify_proof_resp_max_retries: 2,
+        verify_proof_remove_after_max_retries: false,
+        ..Default::default()
+    };
+    let force_per_test_localstack = false;
+    let env =
+        TestEnvironment::new_with_config(signer_type, conf.clone(), force_per_test_localstack)
+            .await?;
+    let provider_deploy = ProviderBuilder::new()
+        .wallet(env.wallet.clone())
+        .connect_ws(WsConnect::new(env.ws_endpoint_url()))
+        .await?;
+    let provider = NonceManagedProvider::new(
+        ProviderBuilder::default()
+            .filler(FillersWithoutNonceManagement::default())
+            .wallet(env.wallet.clone())
+            .connect_ws(WsConnect::new(env.ws_endpoint_url()))
+            .await?,
+        Some(env.wallet.default_signer().address()),
+    );
+    let already_verified_revert = false;
+    let already_rejected_revert = false;
+    let verify_proof_not_requested_revert = false;
+    let other_revert = false;
+    let input_verification = InputVerification::deploy(
+        &provider_deploy,
+        already_verified_revert,
+        already_rejected_revert,
+        verify_proof_not_requested_revert,
+        other_revert,
+    )
+    .await?;
+    provider_deploy
+        .send_transaction_sync(
+            input_verification
+                .setConfigErrorMode(config_error_mode)
+                .into_transaction_request(),
+        )
+        .await?;
+    let already_added_revert = false;
+    let ciphertext_commits =
+        CiphertextCommits::deploy(&provider_deploy, already_added_revert).await?;
+
+    let txn_sender = TransactionSender::new(
+        env.db_pool.clone(),
+        *input_verification.address(),
+        *ciphertext_commits.address(),
+        env.signer.clone(),
+        provider.clone(),
+        env.cancel_token.clone(),
+        env.conf.clone(),
+        None,
+    )
+    .await?;
+
+    let initial_tx_count = provider
+        .get_transaction_count(TxSigner::address(&env.signer))
+        .await?;
+    let proof_id: u32 = random();
+    let run_handle = tokio::spawn(async move { txn_sender.run().await });
+
+    sqlx::query!(
+        "WITH ins AS (
+            INSERT INTO verify_proofs (zk_proof_id, chain_id, contract_address, user_address, handles, verified)
+            VALUES ($1, $2, $3, $4, $5, true)
+        )
+        SELECT pg_notify($6, '')",
+        proof_id as i64,
+        42,
+        env.contract_address.to_string(),
+        env.user_address.to_string(),
+        &[1u8; 64],
+        env.conf.verify_proof_resp_db_channel
+    )
+    .execute(&env.db_pool)
+    .await?;
+
+    let mut attempts = 0;
+    let row = loop {
+        let row = sqlx::query!(
+            "SELECT retry_count, last_error
+             FROM verify_proofs
+             WHERE zk_proof_id = $1",
+            proof_id as i64,
+        )
+        .fetch_one(&env.db_pool)
+        .await?;
+        if row.retry_count == conf.verify_proof_resp_max_retries as i32
+            && row
+                .last_error
+                .as_deref()
+                .is_some_and(is_coprocessor_config_error)
+        {
+            break row;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 60,
+            "timed out waiting for non-retryable state; retry_count={}, last_error={:?}",
+            row.retry_count,
+            row.last_error
+        );
+        sleep(Duration::from_millis(250)).await;
+    };
+    assert_eq!(row.retry_count, conf.verify_proof_resp_max_retries as i32);
+    assert!(
+        row.last_error
+            .as_deref()
+            .is_some_and(is_coprocessor_config_error),
+        "Expected non-retryable gateway config error, got {:?}",
+        row.last_error
+    );
+
+    let tx_count = provider.get_transaction_count(env.signer.address()).await?;
+    assert_eq!(
+        tx_count, initial_tx_count,
+        "Expected no transaction to be sent for gateway config errors detected before send"
+    );
+
+    env.cancel_token.cancel();
+    run_handle.await??;
 
     Ok(())
 }

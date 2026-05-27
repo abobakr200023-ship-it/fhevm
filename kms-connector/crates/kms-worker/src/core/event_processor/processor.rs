@@ -1,17 +1,19 @@
 use crate::core::event_processor::{
     KmsClient,
+    context::ContextManager,
     decryption::{DecryptionProcessor, UserDecryptionExtraData},
     kms::KMSGenerationProcessor,
 };
 use alloy::providers::Provider;
 use anyhow::anyhow;
 use connector_utils::types::{
-    GatewayEvent, GatewayEventKind, KmsGrpcRequest, KmsGrpcResponse, KmsResponseKind,
+    KmsGrpcRequest, KmsGrpcResponse, KmsResponseKind, ProtocolEvent, ProtocolEventKind,
 };
 use sqlx::{Pool, Postgres};
 use thiserror::Error;
 use tonic::Code;
-use tracing::{error, info, warn};
+use tracing::{error, info};
+use user_decryption_signature::Erc1271Error;
 
 /// Interface used to process Gateway's events.
 pub trait EventProcessor: Send {
@@ -25,15 +27,15 @@ pub trait EventProcessor: Send {
 
 /// Struct that processes Gateway's events coming from a `Postgres` database.
 #[derive(Clone)]
-pub struct DbEventProcessor<GP: Provider, HP: Provider> {
+pub struct DbEventProcessor<GP: Provider, HP: Provider, C> {
     /// The GRPC client used to communicate with the KMS Core.
     kms_client: KmsClient,
 
     /// The entity used to process decryption requests.
-    decryption_processor: DecryptionProcessor<GP, HP>,
+    decryption_processor: DecryptionProcessor<GP, HP, C>,
 
     /// The entity used to process key management requests.
-    kms_generation_processor: KMSGenerationProcessor,
+    kms_generation_processor: KMSGenerationProcessor<C>,
 
     /// The maximum number of decryption attempts.
     max_decryption_attempts: u16,
@@ -42,8 +44,8 @@ pub struct DbEventProcessor<GP: Provider, HP: Provider> {
     db_pool: Pool<Postgres>,
 }
 
-impl<GP: Provider, HP: Provider> EventProcessor for DbEventProcessor<GP, HP> {
-    type Event = GatewayEvent;
+impl<GP: Provider, HP: Provider, C: ContextManager> EventProcessor for DbEventProcessor<GP, HP, C> {
+    type Event = ProtocolEvent;
 
     #[tracing::instrument(skip_all)]
     async fn process(&mut self, event: &mut Self::Event) -> Option<KmsResponseKind> {
@@ -53,13 +55,7 @@ impl<GP: Provider, HP: Provider> EventProcessor for DbEventProcessor<GP, HP> {
                 info!("Event successfully processed!");
                 response
             }
-            (Err(ProcessingError::Irrecoverable(e)), _)
-            | (
-                Err(ProcessingError::Recoverable(e)),
-                // Consider all errors as irrecoverable for PrssInit and KeyReshareSameSet, as KMS does
-                // not provide any response for these operations
-                GatewayEventKind::PrssInit(_) | GatewayEventKind::KeyReshareSameSet(_),
-            ) => {
+            (Err(ProcessingError::Irrecoverable(e)), _) => {
                 error!("{}", ProcessingError::Irrecoverable(e));
                 event.mark_as_failed(&self.db_pool).await;
                 None
@@ -71,7 +67,9 @@ impl<GP: Provider, HP: Provider> EventProcessor for DbEventProcessor<GP, HP> {
             // key management operation at all cost.
             (
                 Err(ProcessingError::Recoverable(e)),
-                GatewayEventKind::PublicDecryption(_) | GatewayEventKind::UserDecryption(_),
+                ProtocolEventKind::PublicDecryption(_)
+                | ProtocolEventKind::UserDecryption(_)
+                | ProtocolEventKind::UserDecryptionV2(_),
             ) if event.error_counter as u16 >= self.max_decryption_attempts => {
                 error!(
                     "{}. Maximum number of decryption attempts reached: {}",
@@ -98,11 +96,28 @@ pub enum ProcessingError {
     Recoverable(anyhow::Error),
 }
 
-impl<GP: Provider, HP: Provider> DbEventProcessor<GP, HP> {
+/// ERC-1271 (RFC-012) signature errors map onto `ProcessingError` so callers can use the `?`
+/// operator. Missing code at an EOA is terminal, but smart-account validation can depend on
+/// mutable wallet state, so negative ERC-1271 results are retried through the existing attempt
+/// and validity-window limits.
+impl From<Erc1271Error> for ProcessingError {
+    fn from(err: Erc1271Error) -> Self {
+        match err {
+            Erc1271Error::EoaMismatchNoCode(_) | Erc1271Error::EmptySigOnEoa(_) => {
+                Self::Irrecoverable(anyhow::Error::new(err))
+            }
+            Erc1271Error::Transport(_)
+            | Erc1271Error::WrongMagic(..)
+            | Erc1271Error::Rejected(..) => Self::Recoverable(anyhow::Error::new(err)),
+        }
+    }
+}
+
+impl<GP: Provider, HP: Provider, C: ContextManager> DbEventProcessor<GP, HP, C> {
     pub fn new(
         kms_client: KmsClient,
-        decryption_processor: DecryptionProcessor<GP, HP>,
-        kms_generation_processor: KMSGenerationProcessor,
+        decryption_processor: DecryptionProcessor<GP, HP, C>,
+        kms_generation_processor: KMSGenerationProcessor<C>,
         max_decryption_attempts: u16,
         db_pool: Pool<Postgres>,
     ) -> Self {
@@ -119,13 +134,10 @@ impl<GP: Provider, HP: Provider> DbEventProcessor<GP, HP> {
     #[tracing::instrument(skip_all)]
     async fn prepare_request(
         &self,
-        event: &mut GatewayEvent,
+        event: &mut ProtocolEvent,
     ) -> Result<KmsGrpcRequest, ProcessingError> {
-        let request = match &event.kind {
-            GatewayEventKind::PublicDecryption(req) => {
-                self.decryption_processor
-                    .check_decryption_not_already_done(req.decryptionId)
-                    .await?;
+        match &event.kind {
+            ProtocolEventKind::PublicDecryption(req) => {
                 self.decryption_processor
                     .check_ciphertexts_allowed_for_public_decryption(&req.snsCtMaterials)
                     .await?;
@@ -137,26 +149,25 @@ impl<GP: Provider, HP: Provider> DbEventProcessor<GP, HP> {
                         &req.extraData,
                         None,
                     )
-                    .await?
+                    .await
             }
-            GatewayEventKind::UserDecryption(req) => {
+            ProtocolEventKind::UserDecryption(req) => {
                 // No need to check decryption is done for user decrypt, as MPC parties don't
                 // communicate between each other for user decrypt
 
-                // Skip the ACL check if we don't have the `tx_hash` just for v0.11.
-                // This is tracked by this issue: https://github.com/zama-ai/fhevm-internal/issues/916.
-                if let Some(tx_hash) = event.tx_hash {
-                    let calldata = self.decryption_processor.fetch_calldata(tx_hash).await?;
-                    self.decryption_processor
-                        .check_ciphertexts_allowed_for_user_decryption(
-                            calldata,
-                            &req.snsCtMaterials,
-                            req.userAddress,
-                        )
-                        .await?;
-                } else {
-                    warn!("No `tx_hash` found. Skipping the ACL check!");
-                }
+                let tx_hash = event.tx_hash.ok_or_else(|| {
+                    ProcessingError::Irrecoverable(anyhow!(
+                        "No `tx_hash` found for user decryption. Cannot perform ACL check."
+                    ))
+                })?;
+                let calldata = self.decryption_processor.fetch_calldata(tx_hash).await?;
+                self.decryption_processor
+                    .check_ciphertexts_allowed_for_user_decryption(
+                        calldata,
+                        &req.snsCtMaterials,
+                        req.userAddress,
+                    )
+                    .await?;
                 self.decryption_processor
                     .prepare_decryption_request(
                         req.decryptionId,
@@ -167,31 +178,49 @@ impl<GP: Provider, HP: Provider> DbEventProcessor<GP, HP> {
                             req.publicKey.clone(),
                         )),
                     )
-                    .await?
+                    .await
             }
-            GatewayEventKind::PrepKeygen(req) => self
-                .kms_generation_processor
-                .prepare_prep_keygen_request(req),
-            GatewayEventKind::Keygen(req) => {
-                self.kms_generation_processor.prepare_keygen_request(req)
+            ProtocolEventKind::UserDecryptionV2(req) => {
+                // The RFC016 event carries the full payload, so unlike the legacy path we don't
+                // need to re-fetch the transaction calldata.
+                self.decryption_processor
+                    .check_user_decryption_request_v2(req)
+                    .await?;
+                let payload = &req.payload;
+                self.decryption_processor
+                    .prepare_decryption_request(
+                        req.decryptionId,
+                        &req.snsCtMaterials,
+                        &payload.extraData,
+                        Some(UserDecryptionExtraData::new(
+                            payload.userAddress,
+                            payload.publicKey.clone(),
+                        )),
+                    )
+                    .await
             }
-            GatewayEventKind::Crsgen(req) => {
-                self.kms_generation_processor.prepare_crsgen_request(req)
+            ProtocolEventKind::PrepKeygen(req) => {
+                self.kms_generation_processor
+                    .prepare_prep_keygen_request(req)
+                    .await
             }
-            GatewayEventKind::PrssInit(id) => {
-                self.kms_generation_processor.prepare_prss_init_request(*id)
+            ProtocolEventKind::Keygen(req) => {
+                self.kms_generation_processor
+                    .prepare_keygen_request(req)
+                    .await
             }
-            GatewayEventKind::KeyReshareSameSet(req) => self
-                .kms_generation_processor
-                .prepare_initiate_resharing_request(req),
-        };
-        Ok(request)
+            ProtocolEventKind::Crsgen(req) => {
+                self.kms_generation_processor
+                    .prepare_crsgen_request(req)
+                    .await
+            }
+        }
     }
 
     /// Core event processing logic function.
     async fn inner_process(
         &mut self,
-        event: &mut GatewayEvent,
+        event: &mut ProtocolEvent,
     ) -> Result<Option<KmsResponseKind>, ProcessingError> {
         let request = self
             .prepare_request(event)

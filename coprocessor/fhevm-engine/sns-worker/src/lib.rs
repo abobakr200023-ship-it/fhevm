@@ -19,10 +19,12 @@ use std::{
 use aws_config::{retry::RetryConfig, timeout::TimeoutConfig, BehaviorVersion};
 use aws_sdk_s3::{config::Builder, Client};
 use fhevm_engine_common::{
+    chain_id::ChainId,
+    db_keys::DbKeyId,
+    drift_revert,
     healthz_server::{self},
     metrics_server,
     pg_pool::{PostgresPoolManager, ServiceError},
-    telemetry::{self, OtelTracer},
     types::FhevmError,
     utils::{to_hex, DatabaseURL},
 };
@@ -35,7 +37,6 @@ use tokio::{
         mpsc::{self, Sender},
         RwLock,
     },
-    task,
 };
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, Level};
@@ -57,6 +58,8 @@ type ServerKey = tfhe::ServerKey;
 
 #[derive(Clone)]
 pub struct KeySet {
+    pub key_id_gw: DbKeyId,
+    pub sequence_number: i64,
     /// Optional ClientKey for decrypting on testing
     pub client_key: Option<tfhe::ClientKey>,
     pub server_key: ServerKey,
@@ -110,7 +113,6 @@ pub struct HealthCheckConfig {
 
 #[derive(Clone)]
 pub struct Config {
-    pub tenant_api_key: String,
     pub service_name: String,
     pub db: DBConfig,
     pub s3: S3Config,
@@ -221,7 +223,8 @@ impl std::fmt::Display for Ciphertext128Format {
 
 #[derive(Clone)]
 pub struct HandleItem {
-    pub tenant_id: i32,
+    pub host_chain_id: ChainId,
+    pub key_id_gw: DbKeyId,
     pub handle: Vec<u8>,
 
     /// Compressed 64-bit ciphertext
@@ -234,7 +237,7 @@ pub struct HandleItem {
     /// The computed 128-bit ciphertext
     pub(crate) ct128: Arc<BigCiphertext>,
 
-    pub otel: OtelTracer,
+    pub span: tracing::Span,
     pub transaction_id: Option<Vec<u8>>,
 }
 
@@ -247,15 +250,44 @@ impl HandleItem {
         &self,
         db_txn: &mut Transaction<'_, Postgres>,
     ) -> Result<(), ExecutionError> {
-        sqlx::query!(
-            "INSERT INTO ciphertext_digest (tenant_id, handle, transaction_id)
-            VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-            self.tenant_id,
-            self.handle,
-            self.transaction_id,
-        )
-        .execute(db_txn.as_mut())
-        .await?;
+        let ct128_format = self.ct128.format();
+
+        if self.ct128.is_empty() {
+            sqlx::query(
+                "INSERT INTO ciphertext_digest (host_chain_id, key_id_gw, handle, transaction_id)
+                VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+            )
+            .bind(self.host_chain_id.as_i64())
+            .bind(&self.key_id_gw)
+            .bind(&self.handle)
+            .bind(&self.transaction_id)
+            .execute(db_txn.as_mut())
+            .await?;
+        } else if ct128_format == Ciphertext128Format::Unknown {
+            return Err(ExecutionError::InvalidCiphertext128Format(format!(
+                "non-empty ct128 has unknown format, host_chain_id: {}, handle: {}",
+                self.host_chain_id.as_i64(),
+                to_hex(&self.handle),
+            )));
+        } else {
+            let ct128_format: i16 = ct128_format.into();
+            sqlx::query(
+                "INSERT INTO ciphertext_digest (
+                    host_chain_id, key_id_gw, handle, transaction_id, ciphertext128_format
+                )
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (handle) DO UPDATE
+                SET ciphertext128_format = EXCLUDED.ciphertext128_format
+                WHERE ciphertext_digest.ciphertext128 IS NULL",
+            )
+            .bind(self.host_chain_id.as_i64())
+            .bind(&self.key_id_gw)
+            .bind(&self.handle)
+            .bind(&self.transaction_id)
+            .bind(ct128_format)
+            .execute(db_txn.as_mut())
+            .await?;
+        }
 
         Ok(())
     }
@@ -359,6 +391,9 @@ pub enum ExecutionError {
     #[error("Deserialization error: {0}")]
     DeserializationError(String),
 
+    #[error("Invalid ciphertext128 format: {0}")]
+    InvalidCiphertext128Format(String),
+
     #[error("Bucket not found {0}")]
     BucketNotFound(String),
 
@@ -387,50 +422,6 @@ impl UploadJob {
             UploadJob::DatabaseLock(item) => &item.handle,
         }
     }
-}
-
-/// Runs the SnS worker loop
-pub async fn run_computation_loop(
-    pool_mngr: &PostgresPoolManager,
-    conf: Config,
-    tx: Sender<UploadJob>,
-    token: CancellationToken,
-    client: Arc<Client>,
-    events_tx: InternalEvents,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let port = conf.health_checks.port;
-
-    let service = Arc::new(
-        SwitchNSquashService::create(
-            pool_mngr,
-            conf,
-            tx,
-            token.child_token(),
-            client,
-            events_tx.clone(),
-        )
-        .await?,
-    );
-
-    // Start health check server
-    let healthz = healthz_server::HttpServer::new(service.clone(), port, token.child_token());
-    task::spawn(async move {
-        if let Err(err) = healthz.start().await {
-            error!(
-                task = "health_check",
-                error = %err,
-                "Error while running server"
-            );
-        }
-        anyhow::Ok(())
-    });
-
-    // Run the main service loop
-    service.run(pool_mngr).await;
-    token.cancel();
-
-    info!("Worker stopped");
-    Ok(())
 }
 
 /// Runs the uploader loop
@@ -509,12 +500,6 @@ pub async fn run_all(
     let gpu_enabled = fhevm_engine_common::utils::log_backend();
     info!(gpu_enabled, rayon_threads, config = %config, "Starting SNS worker");
 
-    if !config.service_name.is_empty() {
-        if let Err(err) = telemetry::setup_otlp(&config.service_name) {
-            error!(error = %err, "Failed to setup OTLP");
-        }
-    }
-
     let conf = config.clone();
     let token = parent_token.child_token();
     let tx = uploads_tx.clone();
@@ -549,11 +534,50 @@ pub async fn run_all(
             interval_secs = interval_secs,
             "Starting gauge update routine"
         );
-        spawn_gauge_update_routine(
-            Duration::from_secs(interval_secs.into()),
-            pg_mngr.pool().clone(),
-        );
+        spawn_gauge_update_routine(Duration::from_secs(interval_secs.into()), pg_mngr.pool());
     }
+
+    // Build the service.
+    // create() is a pure struct constructor — no DB or
+    // S3 calls — so it's safe to run before drift_revert::init.
+    let service = Arc::new(
+        SwitchNSquashService::create(
+            &pool_mngr,
+            conf.clone(),
+            uploads_tx,
+            token.child_token(),
+            client,
+            events_tx.clone(),
+        )
+        .await?,
+    );
+
+    // Start health check BEFORE drift_revert::init so the orchestrator sees us as alive.
+    let healthz = healthz_server::HttpServer::new(
+        service.clone(),
+        conf.health_checks.port,
+        token.child_token(),
+    );
+    spawn(async move {
+        if let Err(err) = healthz.start().await {
+            error!(
+                task = "health_check",
+                error = %err,
+                "Error while running server"
+            );
+        }
+        anyhow::Ok(())
+    });
+
+    // Drift-revert: must run before any DB-using task so the uploader and
+    // service loop don't read or write rows the revert SQL is about to delete.
+    drift_revert::init(
+        pool_mngr.pool().clone(),
+        token.clone(),
+        None,
+        drift_revert::WatcherTimeouts::default(),
+    )
+    .await?;
 
     // Spawns a task to handle S3 uploads
     spawn(async move {
@@ -562,16 +586,10 @@ pub async fn run_all(
         }
     });
 
-    // Run the main computation loop
-    // This will handle the PBS computations
-    let conf = config.clone();
-    let token = parent_token.child_token();
+    // Run the main service loop
+    service.run(&pool_mngr).await;
+    token.cancel();
 
-    if let Err(err) =
-        run_computation_loop(&pool_mngr, conf, uploads_tx, token, client, events_tx).await
-    {
-        error!(error = %err, "SnS worker failed");
-    }
-
+    info!("Worker stopped");
     Ok(())
 }

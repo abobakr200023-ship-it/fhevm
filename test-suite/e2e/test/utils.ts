@@ -4,13 +4,11 @@ import { ALL_OPERATORS_PRICES } from '@fhevm/solidity/lib-js/operatorsPrices';
 import { HardhatEthersSigner } from '@nomicfoundation/hardhat-ethers/signers';
 import { toBufferBE } from 'bigint-buffer';
 import { ContractMethodArgs, Log, TransactionReceipt, Typed } from 'ethers';
-import { Signer } from 'ethers';
 import { ethers, network } from 'hardhat';
 import hre from 'hardhat';
 
 import { TypedContractMethod } from '../types/common';
-
-const coprocAddress = process.env.FHEVM_EXECUTOR_CONTRACT_ADDRESS;
+import { coprocessorAddress } from './instance';
 
 export async function checkIsHardhatSigner(signer: HardhatEthersSigner) {
   const signers: HardhatEthersSigner[] = await hre.ethers.getSigners();
@@ -86,6 +84,31 @@ export const mineNBlocks = async (n: number) => {
   }
 };
 
+export const waitForPendingTransactions = async (txHashes: string[], timeoutMs = 30_000): Promise<void> => {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const pendingBlock = await ethers.provider.send('eth_getBlockByNumber', ['pending', false]);
+    const pendingTxHashes = new Set<string>(pendingBlock?.transactions ?? []);
+    if (txHashes.every((txHash) => pendingTxHashes.has(txHash))) {
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for pending txs: ${txHashes.join(', ')}`);
+};
+
+export const waitForTransactionReceipt = async (txHash: string, timeoutMs = 30_000): Promise<TransactionReceipt> => {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const receipt = await ethers.provider.getTransactionReceipt(txHash);
+    if (receipt) {
+      return receipt;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  throw new Error(`Timed out waiting for receipt: ${txHash}`);
+};
+
 export const bigIntToBytes64 = (value: bigint) => {
   return new Uint8Array(toBufferBE(value, 64));
 };
@@ -96,105 +119,6 @@ export const bigIntToBytes128 = (value: bigint) => {
 
 export const bigIntToBytes256 = (value: bigint) => {
   return new Uint8Array(toBufferBE(value, 256));
-};
-
-export const userDecryptSingleHandle = async (
-  handle: string,
-  contractAddress: string,
-  instance: any,
-  signer: Signer,
-  privateKey: string,
-  publicKey: string,
-): Promise<bigint | boolean | string> => {
-  const HandleContractPairs = [
-    {
-      handle: handle,
-      contractAddress: contractAddress,
-    },
-  ];
-  const startTimeStamp = Math.floor(Date.now() / 1000);
-  const durationDays = 10; // Relayer-sdk expects numbers from now on
-  const contractAddresses = [contractAddress];
-
-  // Use the new createEIP712 function
-  const eip712 = instance.createEIP712(publicKey, contractAddresses, startTimeStamp, durationDays);
-
-  // Update the signing to match the new primaryType
-  const signature = await signer.signTypedData(
-    eip712.domain,
-    {
-      UserDecryptRequestVerification: eip712.types.UserDecryptRequestVerification,
-    },
-    eip712.message,
-  );
-
-  const signerAddress = await signer.getAddress();
-  const result = await instance.userDecrypt(
-    HandleContractPairs,
-    privateKey,
-    publicKey,
-    signature.replace('0x', ''),
-    contractAddresses,
-    signerAddress,
-    startTimeStamp,
-    durationDays,
-  );
-
-  const decryptedValue = result[handle];
-  return decryptedValue;
-};
-
-export const delegatedUserDecryptSingleHandle = async (
-  instance: any,
-  handle: string,
-  contractAddress: string,
-  delegatorAddress: string,
-  delegateAddress: string,
-  signer: Signer,
-  delegatePrivateKey: string,
-  delegatePublicKey: string,
-): Promise<bigint | boolean | string> => {
-  const handleContractPairs = [
-    {
-      handle,
-      contractAddress,
-    },
-  ];
-  const startTimeStamp = Math.floor(Date.now() / 1000);
-  const durationDays = 10;
-  const contractAddresses = [contractAddress];
-
-  // The `delegate` creates a EIP712 with the `delegator` address
-  const eip712 = instance.createDelegatedUserDecryptEIP712(
-    delegatePublicKey,
-    contractAddresses,
-    delegatorAddress,
-    startTimeStamp,
-    durationDays,
-  );
-
-  // Update the signing to match the new primaryType
-  const delegateSignature = await signer.signTypedData(
-    eip712.domain,
-    {
-      DelegatedUserDecryptRequestVerification: eip712.types.DelegatedUserDecryptRequestVerification,
-    },
-    eip712.message,
-  );
-
-  const result = await instance.delegatedUserDecrypt(
-    handleContractPairs,
-    delegatePrivateKey,
-    delegatePublicKey,
-    delegateSignature.replace('0x', ''),
-    contractAddresses,
-    delegatorAddress,
-    delegateAddress,
-    startTimeStamp,
-    durationDays,
-  );
-
-  return result[handle];
 };
 
 const abi = [
@@ -229,6 +153,8 @@ const abi = [
   'event FheIfThenElse(address indexed caller, bytes32 control, bytes32 ifTrue, bytes32 ifFalse, bytes32 result)',
   'event FheRand(address indexed caller, uint8 randType, bytes16 seed, bytes32 result)',
   'event FheRandBounded(address indexed caller, uint256 upperBound, uint8 randType, bytes16 seed, bytes32 result)',
+  'event FheSum(address indexed caller, bytes32[] values, bytes32 result)',
+  'event FheIsIn(address indexed caller, bytes32 value, bytes32[] values, bytes32 result)',
 ];
 
 export function getTxHCUFromTxReceipt(
@@ -253,9 +179,9 @@ export function getTxHCUFromTxReceipt(
   let hcuMap: Record<string, number> = {};
   let handleSet: Set<string> = new Set();
 
-  const contract = new ethers.Contract(coprocAddress!, abi, ethers.provider);
+  const contract = new ethers.Contract(coprocessorAddress, abi, ethers.provider);
   const relevantLogs = receipt.logs.filter((log: Log) => {
-    if (log.address.toLowerCase() !== coprocAddress!.toLowerCase()) {
+    if (log.address.toLowerCase() !== coprocessorAddress.toLowerCase()) {
       return false;
     }
     try {
@@ -930,6 +856,69 @@ export function getTxHCUFromTxReceipt(
         handleSet.add(handleResult);
         totalHCUConsumed += hcuConsumed;
         break;
+
+      case 'FheSum': {
+        handleResult = ethers.toBeHex(event.args[2], 32);
+        typeIndex = parseInt(handleResult.slice(-4, -2), 16);
+        type = FheTypes.find((t) => t.value === typeIndex)?.type;
+        if (!type) {
+          throw new Error(`Invalid FheTypeInfo index: ${typeIndex}`);
+        }
+        const nBucketedPrices = (
+          ALL_OPERATORS_PRICES['fheSum'].nBucketed as Record<
+            string,
+            { le10: number; le30?: number; le60?: number; le100?: number }
+          >
+        )[type];
+        const n = (event.args[1] as string[]).length;
+        if (n <= 10) hcuConsumed = nBucketedPrices.le10;
+        else if (n <= 30) hcuConsumed = nBucketedPrices.le30 ?? nBucketedPrices.le10;
+        else if (n <= 60) hcuConsumed = nBucketedPrices.le60 ?? nBucketedPrices.le30 ?? nBucketedPrices.le10;
+        else
+          hcuConsumed = nBucketedPrices.le100 ?? nBucketedPrices.le60 ?? nBucketedPrices.le30 ?? nBucketedPrices.le10;
+        const inputValues = event.args[1] as string[];
+        const maxInputHCU =
+          inputValues.length > 0 ? Math.max(...inputValues.map((v) => readFromHCUMap(ethers.toBeHex(v, 32)))) : 0;
+        hcuMap[handleResult] = hcuConsumed + maxInputHCU;
+        handleSet.add(handleResult);
+        totalHCUConsumed += hcuConsumed;
+        break;
+      }
+
+      case 'FheIsIn': {
+        handleResult = ethers.toBeHex(event.args[3], 32);
+        const isInInputHandle = ethers.toBeHex(event.args[1], 32);
+        typeIndex = parseInt(isInInputHandle.slice(-4, -2), 16);
+        type = FheTypes.find((t) => t.value === typeIndex)?.type;
+        if (!type) {
+          throw new Error(`Invalid FheTypeInfo index: ${typeIndex}`);
+        }
+        const nBucketedIsInPrices = (
+          ALL_OPERATORS_PRICES['fheIsIn'].nBucketed as Record<
+            string,
+            { le10: number; le30?: number; le60?: number; le100?: number }
+          >
+        )[type];
+        const setHandles = event.args[2] as string[];
+        const setSize = setHandles.length;
+        if (setSize <= 10) hcuConsumed = nBucketedIsInPrices.le10;
+        else if (setSize <= 30) hcuConsumed = nBucketedIsInPrices.le30 ?? nBucketedIsInPrices.le10;
+        else if (setSize <= 60)
+          hcuConsumed = nBucketedIsInPrices.le60 ?? nBucketedIsInPrices.le30 ?? nBucketedIsInPrices.le10;
+        else
+          hcuConsumed =
+            nBucketedIsInPrices.le100 ??
+            nBucketedIsInPrices.le60 ??
+            nBucketedIsInPrices.le30 ??
+            nBucketedIsInPrices.le10;
+        const valueHandle = ethers.toBeHex(event.args[1], 32);
+        const allInputHandles = [valueHandle, ...setHandles.map((h) => ethers.toBeHex(h, 32))];
+        const maxInputHCU = Math.max(...allInputHandles.map((h) => readFromHCUMap(h)));
+        hcuMap[handleResult] = hcuConsumed + maxInputHCU;
+        handleSet.add(handleResult);
+        totalHCUConsumed += hcuConsumed;
+        break;
+      }
     }
   }
 

@@ -1,12 +1,22 @@
+use fhevm_engine_common::chain_id::ChainId;
+use fhevm_engine_common::crs::CrsCache;
+use fhevm_engine_common::db_keys::DbKeyCache;
 use fhevm_engine_common::pg_pool::PostgresPoolManager;
-use fhevm_engine_common::{tenant_keys, utils::safe_serialize};
+use fhevm_engine_common::tfhe_ops::{current_ciphertext_version, extract_ct_list};
+use fhevm_engine_common::types::SupportedFheCiphertexts;
+use fhevm_engine_common::utils::{safe_deserialize_conformant, safe_serialize};
+use sha3::Digest;
+use sha3::Keccak256;
+use sqlx::Row;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use test_harness::instance::{DBInstance, ImportMode};
+use tfhe::integer::ciphertext::IntegerProvenCompactCiphertextListConformanceParams;
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 
 use crate::auxiliary::ZkData;
+use crate::verifier::MAX_CACHED_KEYS;
 
 pub async fn setup() -> anyhow::Result<(PostgresPoolManager, DBInstance)> {
     let _ = tracing_subscriber::fmt().json().with_level(true).try_init();
@@ -80,6 +90,204 @@ pub(crate) async fn is_valid(
     Ok(false)
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredCiphertext {
+    pub(crate) handle: Vec<u8>,
+    pub(crate) ciphertext: Vec<u8>,
+    pub(crate) ciphertext_type: i16,
+    pub(crate) input_blob_index: i32,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DecryptionResult {
+    pub(crate) output_type: i16,
+    pub(crate) value: String,
+}
+
+pub(crate) async fn wait_for_handles(
+    pool: &sqlx::PgPool,
+    zk_proof_id: i64,
+    max_retries: usize,
+) -> Result<Vec<Vec<u8>>, sqlx::Error> {
+    for _ in 0..max_retries {
+        sleep(Duration::from_millis(100)).await;
+        let row = sqlx::query("SELECT verified, handles FROM verify_proofs WHERE zk_proof_id = $1")
+            .bind(zk_proof_id)
+            .fetch_one(pool)
+            .await?;
+
+        let verified: Option<bool> = row.try_get("verified")?;
+        if !matches!(verified, Some(true)) {
+            continue;
+        }
+
+        let handles: Option<Vec<u8>> = row.try_get("handles")?;
+        let handles = handles.unwrap_or_default();
+        assert_eq!(handles.len() % 32, 0);
+
+        return Ok(handles.chunks(32).map(|chunk| chunk.to_vec()).collect());
+    }
+
+    Ok(vec![])
+}
+
+pub(crate) async fn fetch_stored_ciphertexts(
+    pool: &sqlx::PgPool,
+    handles: &[Vec<u8>],
+) -> Result<Vec<StoredCiphertext>, sqlx::Error> {
+    if handles.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let rows = sqlx::query(
+        "
+            SELECT handle, ciphertext, ciphertext_type, input_blob_index
+            FROM ciphertexts
+            WHERE handle = ANY($1::BYTEA[])
+            AND ciphertext_version = $2
+            ORDER BY input_blob_index ASC
+        ",
+    )
+    .bind(handles)
+    .bind(current_ciphertext_version())
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(StoredCiphertext {
+                handle: row.try_get("handle")?,
+                ciphertext: row.try_get("ciphertext")?,
+                ciphertext_type: row.try_get("ciphertext_type")?,
+                input_blob_index: row.try_get("input_blob_index")?,
+            })
+        })
+        .collect()
+}
+
+pub(crate) async fn decrypt_ciphertexts(
+    pool: &sqlx::PgPool,
+    handles: &[Vec<u8>],
+) -> anyhow::Result<Vec<DecryptionResult>> {
+    let stored = fetch_stored_ciphertexts(pool, handles).await?;
+    let db_key_cache = DbKeyCache::new(MAX_CACHED_KEYS).expect("create db key cache");
+    let key = db_key_cache.fetch_latest_from_pool(pool).await?;
+
+    tokio::task::spawn_blocking(move || {
+        let client_key = key.cks.expect("client key available in tests");
+        tfhe::set_server_key(key.sks);
+
+        stored
+            .into_iter()
+            .map(|ct| {
+                let deserialized = SupportedFheCiphertexts::decompress_no_memcheck(
+                    ct.ciphertext_type,
+                    &ct.ciphertext,
+                )
+                .expect("valid compressed ciphertext");
+                DecryptionResult {
+                    output_type: ct.ciphertext_type,
+                    value: deserialized.decrypt(&client_key),
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(anyhow::Error::from)
+}
+
+pub(crate) async fn compress_inputs_without_rerandomization(
+    pool: &sqlx::PgPool,
+    raw_ct: &[u8],
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let db_key_cache = DbKeyCache::new(MAX_CACHED_KEYS).expect("create db key cache");
+    let latest_key = db_key_cache.fetch_latest_from_pool(pool).await?;
+    let latest_crs = CrsCache::load(pool)
+        .await?
+        .get_latest()
+        .cloned()
+        .expect("latest CRS");
+
+    let verified_list: tfhe::ProvenCompactCiphertextList = safe_deserialize_conformant(
+        raw_ct,
+        &IntegerProvenCompactCiphertextListConformanceParams::from_public_key_encryption_parameters_and_crs_parameters(
+            latest_key.pks.parameters(),
+            &latest_crs.crs,
+        ),
+    )?;
+
+    if verified_list.is_empty() {
+        return Ok(vec![]);
+    }
+
+    tokio::task::spawn_blocking(move || {
+        tfhe::set_server_key(latest_key.sks);
+        let expanded = verified_list.expand_without_verification()?;
+        let cts = extract_ct_list(&expanded)?;
+        cts.into_iter()
+            .map(|ct| ct.compress().map_err(anyhow::Error::from))
+            .collect()
+    })
+    .await?
+}
+
+pub(crate) async fn compress_inputs_with_compact_list_rerandomization(
+    pool: &sqlx::PgPool,
+    raw_ct: &[u8],
+    aux_data: &ZkData,
+) -> anyhow::Result<Vec<Vec<u8>>> {
+    let db_key_cache = DbKeyCache::new(MAX_CACHED_KEYS).expect("create db key cache");
+    let latest_key = db_key_cache.fetch_latest_from_pool(pool).await?;
+    let latest_crs = CrsCache::load(pool)
+        .await?
+        .get_latest()
+        .cloned()
+        .expect("latest CRS");
+    let aux_data_bytes = aux_data.assemble()?;
+
+    let verified_list: tfhe::ProvenCompactCiphertextList = safe_deserialize_conformant(
+        raw_ct,
+        &IntegerProvenCompactCiphertextListConformanceParams::from_public_key_encryption_parameters_and_crs_parameters(
+            latest_key.pks.parameters(),
+            &latest_crs.crs,
+        ),
+    )?;
+
+    if verified_list.is_empty() {
+        return Ok(vec![]);
+    }
+
+    assert!(verified_list
+        .verify(&latest_crs.crs, &latest_key.pks, &aux_data_bytes)
+        .is_valid());
+
+    let mut hasher = Keccak256::new();
+    hasher.update(crate::verifier::RAW_CT_HASH_DOMAIN_SEPARATOR);
+    hasher.update(raw_ct);
+    let blob_hash = hasher.finalize().to_vec();
+
+    tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<Vec<u8>>> {
+        tfhe::set_server_key(latest_key.sks.clone());
+
+        let mut re_rand_context = tfhe::ReRandomizationContext::new(
+            crate::verifier::RERANDOMISATION_DOMAIN_SEPARATOR,
+            [blob_hash.as_slice()],
+            crate::verifier::COMPACT_PUBLIC_ENCRYPTION_DOMAIN_SEPARATOR,
+        );
+        re_rand_context.add_ciphertext(&verified_list);
+
+        let mut seed_gen = re_rand_context.finalize();
+        let expanded = verified_list
+            .re_randomize_and_expand_without_verification(&latest_key.pks, seed_gen.next_seed()?)?;
+
+        let mut cts = extract_ct_list(&expanded)?;
+        cts.iter_mut()
+            .map(|ct| ct.compress().map_err(anyhow::Error::from))
+            .collect()
+    })
+    .await?
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ZkInput {
     Bool(bool),
@@ -89,22 +297,35 @@ pub(crate) enum ZkInput {
     U64(u64),
 }
 
+impl ZkInput {
+    pub(crate) fn cleartext(&self) -> String {
+        match self {
+            Self::Bool(value) => value.to_string(),
+            Self::U8(value) => value.to_string(),
+            Self::U16(value) => value.to_string(),
+            Self::U32(value) => value.to_string(),
+            Self::U64(value) => value.to_string(),
+        }
+    }
+}
+
 pub(crate) async fn generate_zk_pok_with_inputs(
     pool: &sqlx::PgPool,
     aux_data: &[u8],
     inputs: &[ZkInput],
 ) -> Vec<u8> {
-    let keys: Vec<tenant_keys::TfheTenantKeys> =
-        tenant_keys::query_tenant_keys(vec![1], pool, true)
-            .await
-            .map_err(|e| {
-                let e: Box<dyn std::error::Error> = e;
-                e
-            })
-            .unwrap();
-    let keys = &keys[0];
+    let db_key_cache = DbKeyCache::new(MAX_CACHED_KEYS).expect("create db key cache");
 
-    let mut builder = tfhe::ProvenCompactCiphertextList::builder(&keys.pks);
+    let latest_key = db_key_cache.fetch_latest_from_pool(pool).await.unwrap();
+
+    let latest_crs = CrsCache::load(pool)
+        .await
+        .unwrap()
+        .get_latest()
+        .cloned()
+        .unwrap();
+
+    let mut builder = tfhe::ProvenCompactCiphertextList::builder(&latest_key.pks);
     for v in inputs {
         match *v {
             ZkInput::Bool(b) => builder.push(b),
@@ -116,11 +337,7 @@ pub(crate) async fn generate_zk_pok_with_inputs(
     }
 
     let the_list = builder
-        .build_with_proof_packed(
-            &keys.public_params,
-            aux_data,
-            tfhe::zk::ZkComputeLoad::Proof,
-        )
+        .build_with_proof_packed(&latest_crs.crs, aux_data, tfhe::zk::ZkComputeLoad::Proof)
         .unwrap();
 
     safe_serialize(&the_list)
@@ -154,7 +371,7 @@ pub(crate) async fn insert_proof(
             VALUES ($1, $2, $3, $4, $5, NULL )" 
         ).bind(request_id)
         .bind(zk_pok)
-        .bind(aux.chain_id)
+        .bind(aux.chain_id.as_i64())
         .bind(aux.contract_address.clone())
         .bind(aux.user_address.clone())
         .execute(pool).await?;
@@ -178,7 +395,7 @@ pub(crate) fn aux_fixture(acl_contract_address: String) -> (ZkData, [u8; 92]) {
         contract_address,
         user_address,
         acl_contract_address,
-        chain_id: 12345,
+        chain_id: ChainId::try_from(12345_u64).unwrap(),
     };
 
     (

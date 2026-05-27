@@ -53,10 +53,6 @@ impl SupportedFheCiphertexts {
     }
 }
 
-pub fn get_supported_ct_size_on_gpu(ct_type: i16) -> u64 {
-    trivial_encrypt_be_bytes(ct_type, &[1u8]).get_size_on_gpu()
-}
-
 // Reserving GPU memory happens in two stages:
 //  - we add the amount we need atomically to the GPU's reservation pool
 //  - we check that the new pool fits on GPU
@@ -82,10 +78,57 @@ pub fn release_memory_on_gpu(amount: u64, idx: usize) {
     let _ = gpu_mem_reservation[idx].fetch_sub(amount, std::sync::atomic::Ordering::SeqCst);
 }
 
+fn get_fhe_sum_size_on_gpu(
+    _fhe_operation: i16,
+    input_operands: &[SupportedFheCiphertexts],
+) -> Result<u64, FhevmError> {
+    if input_operands.is_empty() {
+        return Ok(0);
+    }
+    let n = input_operands.len() as u64;
+    // No dedicated get_sum_size_on_gpu API exists in tfhe-rs; using N * ciphertext_size
+    // as an approximation.
+    match &input_operands[0] {
+        SupportedFheCiphertexts::FheUint8(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint16(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint32(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint64(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint128(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        _ => Err(FhevmError::UnsupportedFheTypes {
+            fhe_operation: format!("{:?}", _fhe_operation),
+            input_types: input_operands.iter().map(|i| i.type_name()).collect(),
+        }),
+    }
+}
+
+fn get_fhe_is_in_size_on_gpu(
+    _fhe_operation: i16,
+    input_operands: &[SupportedFheCiphertexts],
+) -> Result<u64, FhevmError> {
+    if input_operands.is_empty() {
+        return Ok(0);
+    }
+    let n = input_operands.len() as u64;
+    // No dedicated API exists; using N * ciphertext_size as an approximation.
+    match &input_operands[0] {
+        SupportedFheCiphertexts::FheUint8(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint16(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint32(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint64(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint128(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint160(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        SupportedFheCiphertexts::FheUint256(v) => Ok(v.get_size_on_gpu().saturating_mul(n)),
+        _ => Err(FhevmError::UnsupportedFheTypes {
+            fhe_operation: format!("{:?}", _fhe_operation),
+            input_types: input_operands.iter().map(|i| i.type_name()).collect(),
+        }),
+    }
+}
+
 pub fn get_op_size_on_gpu(
     fhe_operation_int: i16,
     input_operands: &[SupportedFheCiphertexts],
-    // for deterministc randomness functions
+    // for deterministic randomness functions
 ) -> Result<u64, FhevmError> {
     let fhe_operation: SupportedFheOperations =
         fhe_operation_int.try_into().expect("Invalid operation");
@@ -1724,11 +1767,10 @@ pub fn get_op_size_on_gpu(
         }
         SupportedFheOperations::FheTrivialEncrypt | SupportedFheOperations::FheCast => {
             match (&input_operands[0], &input_operands[1]) {
-                (_, SupportedFheCiphertexts::Scalar(op)) => Ok(trivial_encrypt_be_bytes(
-                    to_be_u16_bit(op) as i16,
-                    &[1u8],
-                )
-                .get_size_on_gpu()),
+                (_, SupportedFheCiphertexts::Scalar(op)) => {
+                    Ok(trivial_encrypt_be_bytes(to_be_u16_bit(op) as i16, &[1u8])?
+                        .get_size_on_gpu())
+                }
                 (_, _) => Err(FhevmError::UnsupportedFheTypes {
                     fhe_operation: format!("{:?}", fhe_operation),
                     input_types: input_operands.iter().map(|i| i.type_name()).collect(),
@@ -1795,6 +1837,89 @@ pub fn get_op_size_on_gpu(
                 11 => Ok(
                     tfhe::FheUint2048::get_generate_oblivious_pseudo_random_bounded_size_on_gpu(),
                 ),
+                _ => Err(FhevmError::UnsupportedFheTypes {
+                    fhe_operation: format!("{:?}", fhe_operation),
+                    input_types: input_operands.iter().map(|i| i.type_name()).collect(),
+                }),
+            }
+        }
+        SupportedFheOperations::FheSum => {
+            get_fhe_sum_size_on_gpu(fhe_operation_int, input_operands)
+        }
+        SupportedFheOperations::FheIsIn => {
+            get_fhe_is_in_size_on_gpu(fhe_operation_int, input_operands)
+        }
+        SupportedFheOperations::FheMulDiv => {
+            // MulDiv[T] runs at 2T bit-width internally.
+            let widened_workspace = |mul_size: u64, div_size: u64| -> u64 {
+                (mul_size + div_size) * 2u64.pow(2) // double size with quadratic space complexity
+            };
+            assert_eq!(input_operands.len(), 3);
+            match (&input_operands[0], &input_operands[1], &input_operands[2]) {
+                (
+                    SupportedFheCiphertexts::FheUint8(a),
+                    SupportedFheCiphertexts::FheUint8(b),
+                    SupportedFheCiphertexts::Scalar(d),
+                ) => Ok(widened_workspace(
+                    a.get_mul_size_on_gpu(b),
+                    a.get_div_size_on_gpu(to_be_u8_bit(d)),
+                )),
+                (
+                    SupportedFheCiphertexts::FheUint16(a),
+                    SupportedFheCiphertexts::FheUint16(b),
+                    SupportedFheCiphertexts::Scalar(d),
+                ) => Ok(widened_workspace(
+                    a.get_mul_size_on_gpu(b),
+                    a.get_div_size_on_gpu(to_be_u16_bit(d)),
+                )),
+                (
+                    SupportedFheCiphertexts::FheUint32(a),
+                    SupportedFheCiphertexts::FheUint32(b),
+                    SupportedFheCiphertexts::Scalar(d),
+                ) => Ok(widened_workspace(
+                    a.get_mul_size_on_gpu(b),
+                    a.get_div_size_on_gpu(to_be_u32_bit(d)),
+                )),
+                (
+                    SupportedFheCiphertexts::FheUint64(a),
+                    SupportedFheCiphertexts::FheUint64(b),
+                    SupportedFheCiphertexts::Scalar(d),
+                ) => Ok(widened_workspace(
+                    a.get_mul_size_on_gpu(b),
+                    a.get_div_size_on_gpu(to_be_u64_bit(d)),
+                )),
+                (
+                    SupportedFheCiphertexts::FheUint8(a),
+                    SupportedFheCiphertexts::Scalar(b),
+                    SupportedFheCiphertexts::Scalar(d),
+                ) => Ok(widened_workspace(
+                    a.get_mul_size_on_gpu(to_be_u8_bit(b)),
+                    a.get_div_size_on_gpu(to_be_u8_bit(d)),
+                )),
+                (
+                    SupportedFheCiphertexts::FheUint16(a),
+                    SupportedFheCiphertexts::Scalar(b),
+                    SupportedFheCiphertexts::Scalar(d),
+                ) => Ok(widened_workspace(
+                    a.get_mul_size_on_gpu(to_be_u16_bit(b)),
+                    a.get_div_size_on_gpu(to_be_u16_bit(d)),
+                )),
+                (
+                    SupportedFheCiphertexts::FheUint32(a),
+                    SupportedFheCiphertexts::Scalar(b),
+                    SupportedFheCiphertexts::Scalar(d),
+                ) => Ok(widened_workspace(
+                    a.get_mul_size_on_gpu(to_be_u32_bit(b)),
+                    a.get_div_size_on_gpu(to_be_u32_bit(d)),
+                )),
+                (
+                    SupportedFheCiphertexts::FheUint64(a),
+                    SupportedFheCiphertexts::Scalar(b),
+                    SupportedFheCiphertexts::Scalar(d),
+                ) => Ok(widened_workspace(
+                    a.get_mul_size_on_gpu(to_be_u64_bit(b)),
+                    a.get_div_size_on_gpu(to_be_u64_bit(d)),
+                )),
                 _ => Err(FhevmError::UnsupportedFheTypes {
                     fhe_operation: format!("{:?}", fhe_operation),
                     input_types: input_operands.iter().map(|i| i.type_name()).collect(),

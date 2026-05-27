@@ -3,8 +3,6 @@ name: kms-connector-tests
 
 on:
   pull_request:
-  push:
-    branches: ['main', 'release/*']
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref }}
@@ -41,8 +39,9 @@ jobs:
             - kms-connector/connector-db/**
             - kms-connector/crates/**
             - kms-connector/Cargo.*
-            - gateway-contracts/rust-bindings/**
-            - host-contracts/rust-bindings/**
+            - gateway-contracts/rust_bindings/**
+            - host-contracts/rust_bindings/**
+            - shared/user-decryption-signature/**
 
   start-runner:
     name: kms-connector-tests/start-runner
@@ -97,14 +96,17 @@ jobs:
           echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "${GITHUB_ENV}"
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: zama-ai/ci-templates/.github/actions/retry@542103e14b9ae6a9aea27787b8724b3b35bb3918 # v1.0.9
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GHCR_READ_TOKEN }}
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GHCR_READ_TOKEN }}
+          command: |
+            echo "Logging into ghcr.io..."
+            echo "$GHCR_PASSWORD" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # v1
         with:
           toolchain: stable
           components: rustfmt, clippy

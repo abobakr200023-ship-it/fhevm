@@ -66,6 +66,19 @@ contract ACLTest is HostContractsDeployerTestUtils {
     }
 
     /**
+     * @dev Bundles common `vm.assume` preconditions for wildcard-delegation fuzz tests.
+     */
+    function _assumeWildcardTestPreconditions(address sender, address delegate, address contractAddress) internal view {
+        vm.assume(sender != contractAddress);
+        vm.assume(sender != delegate);
+        vm.assume(delegate != contractAddress);
+        vm.assume(sender != acl.WILDCARD_DELEGATION_ADDRESS());
+        vm.assume(contractAddress != acl.WILDCARD_DELEGATION_ADDRESS());
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
+        vm.assume(block.timestamp < type(uint64).max - 8 hours);
+    }
+
+    /**
      * @dev Sets up the testing environment by deploying a proxy contract and initializing signers.
      * This function is executed before each test to ensure a consistent and isolated state.
      */
@@ -85,7 +98,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
      * It checks that the version is correct, the owner/pauser are set to the expected addresses, and the fhevmExecutor address is correct.
      */
     function test_PostProxyUpgradeCheck() public view {
-        assertEq(acl.getVersion(), string(abi.encodePacked("ACL v0.2.0")));
+        assertEq(acl.getVersion(), string(abi.encodePacked("ACL v0.5.0")));
         assertEq(acl.owner(), owner);
         assertEq(acl.isPauser(pauser), true);
         assertEq(acl.getFHEVMExecutorAddress(), fhevmExecutorAdd);
@@ -104,6 +117,99 @@ contract ACLTest is HostContractsDeployerTestUtils {
      */
     function test_IsAllowedForDecryptionReturnsFalseIfNotAllowed(bytes32 handle) public view {
         assertFalse(acl.isAllowedForDecryption(handle));
+    }
+
+    /**
+     * @dev Tests that the decryption signature invalidation getter defaults to zero.
+     */
+    function test_DecryptionSignatureInvalidatedBeforeDefaultsToZero(address account) public view {
+        assertEq(acl.decryptionSignatureInvalidatedBefore(account), 0);
+    }
+
+    /**
+     * @dev Tests that explicit invalidation timestamps are stored and emitted without affecting other accounts.
+     */
+    function test_CanInvalidateDecryptionSignaturesBeforeWithExplicitTimestamp() public {
+        address account = _oneRandomAddress();
+        address otherAccount = _oneRandomAddress();
+        vm.assume(account != otherAccount);
+        vm.warp(100);
+
+        vm.expectEmit(address(acl));
+        emit ACLEvents.DecryptionSignaturesInvalidated(account, 42);
+
+        vm.prank(account);
+        acl.invalidateDecryptionSignaturesBefore(42);
+
+        assertEq(acl.decryptionSignatureInvalidatedBefore(account), 42);
+        assertEq(acl.decryptionSignatureInvalidatedBefore(otherAccount), 0);
+
+        vm.prank(otherAccount);
+        acl.invalidateDecryptionSignaturesBefore(43);
+
+        assertEq(acl.decryptionSignatureInvalidatedBefore(account), 42);
+        assertEq(acl.decryptionSignatureInvalidatedBefore(otherAccount), 43);
+    }
+
+    /**
+     * @dev Tests that passing zero resolves to the current block timestamp.
+     */
+    function test_CanInvalidateDecryptionSignaturesBeforeAtCurrentBlockTimestampWhenZero() public {
+        address account = _oneRandomAddress();
+        vm.warp(321);
+
+        vm.expectEmit(address(acl));
+        emit ACLEvents.DecryptionSignaturesInvalidated(account, block.timestamp);
+
+        vm.prank(account);
+        acl.invalidateDecryptionSignaturesBefore(0);
+
+        assertEq(acl.decryptionSignatureInvalidatedBefore(account), block.timestamp);
+    }
+
+    /**
+     * @dev Tests that invalidation timestamps must increase monotonically.
+     */
+    function test_CannotInvalidateDecryptionSignaturesBeforeWithEqualOrLowerTimestamp() public {
+        address account = _oneRandomAddress();
+        vm.warp(200);
+
+        vm.prank(account);
+        acl.invalidateDecryptionSignaturesBefore(150);
+
+        vm.prank(account);
+        vm.expectRevert(ACL.InvalidationTimestampTooLow.selector);
+        acl.invalidateDecryptionSignaturesBefore(150);
+
+        vm.prank(account);
+        vm.expectRevert(ACL.InvalidationTimestampTooLow.selector);
+        acl.invalidateDecryptionSignaturesBefore(149);
+    }
+
+    /**
+     * @dev Tests that resolving 0 to block.timestamp still respects monotonicity in the same block.
+     */
+    function test_CannotInvalidateDecryptionSignaturesBeforeWithZeroThenSameBlockTimestamp() public {
+        address account = _oneRandomAddress();
+        vm.warp(777);
+
+        vm.prank(account);
+        acl.invalidateDecryptionSignaturesBefore(0);
+
+        vm.prank(account);
+        vm.expectRevert(ACL.InvalidationTimestampTooLow.selector);
+        acl.invalidateDecryptionSignaturesBefore(block.timestamp);
+    }
+
+    /**
+     * @dev Tests that invalidation timestamps cannot be in the future.
+     */
+    function test_CannotInvalidateDecryptionSignaturesBeforeWithFutureTimestamp() public {
+        address account = _oneRandomAddress();
+
+        vm.prank(account);
+        vm.expectRevert(ACL.InvalidationTimestampInTheFuture.selector);
+        acl.invalidateDecryptionSignaturesBefore(block.timestamp + 1);
     }
 
     /**
@@ -187,6 +293,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
         vm.assume(sender != contractAddress);
         vm.assume(sender != delegate);
         vm.assume(delegate != contractAddress);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
 
         ACL.UserDecryptionDelegation memory userDecryptionDelegation;
         uint64 expirationDate = uint64(block.timestamp) + 7 hours;
@@ -225,6 +332,142 @@ contract ACLTest is HostContractsDeployerTestUtils {
     }
 
     /**
+     * @dev Wildcard delegation: `delegateForUserDecryption(delegate, WILDCARD_DELEGATION_ADDRESS, ...)` authorizes the pair for
+     *      any app contract once delegator and that contract are both allowed on the handle (no per-app delegation row).
+     */
+    function test_WildcardDelegationSatisfiesIsHandleDelegatedWithoutPerContractRow(
+        bytes32 handle,
+        address sender,
+        address delegate,
+        address contractAddress
+    ) public {
+        _assumeWildcardTestPreconditions(sender, delegate, contractAddress);
+
+        uint64 expirationDate = uint64(block.timestamp + 7 hours);
+        address wildcardDelegation = acl.WILDCARD_DELEGATION_ADDRESS();
+
+        vm.prank(sender);
+        acl.delegateForUserDecryption(delegate, wildcardDelegation, expirationDate);
+
+        vm.assertFalse(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+        _allowHandle(handle, sender);
+        vm.assertFalse(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+        _allowHandle(handle, contractAddress);
+        vm.assertTrue(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+    }
+
+    /**
+     * @dev Revoking wildcard removes blanket access when there is no per-contract delegation row.
+     */
+    function test_RevokeWildcardRemovesDelegationWhenNoSpecificRow(
+        bytes32 handle,
+        address sender,
+        address delegate,
+        address contractAddress
+    ) public {
+        _assumeWildcardTestPreconditions(sender, delegate, contractAddress);
+
+        uint64 expirationDate = uint64(block.timestamp + 7 hours);
+        address wildcardDelegation = acl.WILDCARD_DELEGATION_ADDRESS();
+
+        vm.prank(sender);
+        acl.delegateForUserDecryption(delegate, wildcardDelegation, expirationDate);
+
+        _allowHandle(handle, sender);
+        _allowHandle(handle, contractAddress);
+        vm.assertTrue(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+
+        vm.roll(block.number + 1);
+        address wildcardForRevoke = acl.WILDCARD_DELEGATION_ADDRESS();
+        vm.prank(sender);
+        acl.revokeDelegationForUserDecryption(delegate, wildcardForRevoke);
+
+        vm.assertFalse(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+    }
+
+    /**
+     * @dev After revoking wildcard, an existing per-contract delegation row still authorizes the handle.
+     */
+    function test_AfterRevokeWildcardSpecificDelegationStillValid(
+        bytes32 handle,
+        address sender,
+        address delegate,
+        address contractAddress
+    ) public {
+        _assumeWildcardTestPreconditions(sender, delegate, contractAddress);
+
+        uint64 expirationDate = uint64(block.timestamp + 7 hours);
+        address wildcardDelegation = acl.WILDCARD_DELEGATION_ADDRESS();
+
+        vm.prank(sender);
+        acl.delegateForUserDecryption(delegate, wildcardDelegation, expirationDate);
+        vm.roll(block.number + 1);
+        vm.prank(sender);
+        acl.delegateForUserDecryption(delegate, contractAddress, expirationDate);
+
+        _allowHandle(handle, sender);
+        _allowHandle(handle, contractAddress);
+
+        vm.assertTrue(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+
+        vm.roll(block.number + 1);
+        vm.prank(sender);
+        acl.revokeDelegationForUserDecryption(delegate, wildcardDelegation);
+
+        vm.assertTrue(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+    }
+
+    /**
+     * @dev Wildcard does not bypass the requirement that the app contract is persistently allowed on the handle.
+     */
+    function test_WildcardDelegationStillRequiresContractAllowedOnHandle(
+        bytes32 handle,
+        address sender,
+        address delegate,
+        address contractAddress
+    ) public {
+        _assumeWildcardTestPreconditions(sender, delegate, contractAddress);
+
+        uint64 expirationDate = uint64(block.timestamp + 7 hours);
+        address wildcardDelegation = acl.WILDCARD_DELEGATION_ADDRESS();
+        vm.prank(sender);
+        acl.delegateForUserDecryption(delegate, wildcardDelegation, expirationDate);
+
+        _allowHandle(handle, sender);
+        vm.assertFalse(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+    }
+
+    /**
+     * @dev Wildcard delegation is active before the expiration timestamp and inactive at that timestamp.
+     */
+    function test_WildcardDelegationExpiresAtTimestamp(
+        bytes32 handle,
+        address sender,
+        address delegate,
+        address contractAddress
+    ) public {
+        _assumeWildcardTestPreconditions(sender, delegate, contractAddress);
+
+        uint64 expirationDate = uint64(block.timestamp + 7 hours);
+        address wildcardDelegation = acl.WILDCARD_DELEGATION_ADDRESS();
+
+        vm.prank(sender);
+        acl.delegateForUserDecryption(delegate, wildcardDelegation, expirationDate);
+
+        _allowHandle(handle, sender);
+        _allowHandle(handle, contractAddress);
+
+        vm.warp(uint256(expirationDate) - 1);
+        vm.assertTrue(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+
+        vm.warp(expirationDate);
+        vm.assertFalse(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+
+        vm.warp(uint256(expirationDate) + 1);
+        vm.assertFalse(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
+    }
+
+    /**
      * @dev Tests that the sender cannot delegate in the same block twice.
      */
     function test_CannotDelegateForUserDecryptionInSameBlockTwice(
@@ -233,15 +476,18 @@ contract ACLTest is HostContractsDeployerTestUtils {
         address delegate,
         address contractAddress
     ) public {
-        /// @dev We call the other test to avoid repeating the same code.
-        test_CanDelegateForUserDecryptionAndIsHandleDelegatedForUserDecryptionOnlyIfBothContractAndSenderAreAllowed(
-            handle,
-            sender,
-            delegate,
-            contractAddress
-        );
+        vm.assume(sender != contractAddress);
+        vm.assume(sender != delegate);
+        vm.assume(delegate != contractAddress);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
 
         uint64 expirationDate = uint64(block.timestamp) + 7 hours;
+        vm.prank(sender);
+        acl.delegateForUserDecryption(delegate, contractAddress, expirationDate);
+
+        _allowHandle(handle, sender);
+        _allowHandle(handle, contractAddress);
+        vm.assertTrue(acl.isHandleDelegatedForUserDecryption(sender, delegate, contractAddress, handle));
 
         vm.prank(sender);
         vm.expectRevert(
@@ -264,6 +510,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
         address delegate
     ) public {
         vm.assume(sender != delegate);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
 
         uint64 expirationDate = uint64(block.timestamp) + 7 hours;
 
@@ -283,6 +530,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
         vm.assume(sender != contractAddress);
         vm.assume(sender != delegate);
         vm.assume(delegate != contractAddress);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
 
         /// @dev Delegate user decryption for the first time.
         uint64 expirationDate = uint64(block.timestamp) + 7 hours;
@@ -307,9 +555,9 @@ contract ACLTest is HostContractsDeployerTestUtils {
     }
 
     /**
-     * @dev Tests that the sender cannot delegate for user decryption with expiration date before one hour.
+     * @dev Tests that the sender cannot delegate for user decryption with expiration date in the past.
      */
-    function test_CannotDelegateForUserDecryptionWithExpirationDateBeforeOneHour(
+    function test_CannotDelegateForUserDecryptionWithExpirationDateInThePast(
         address sender,
         address delegate,
         address contractAddress
@@ -317,11 +565,12 @@ contract ACLTest is HostContractsDeployerTestUtils {
         vm.assume(sender != contractAddress);
         vm.assume(sender != delegate);
         vm.assume(delegate != contractAddress);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
 
         uint64 expirationDate = uint64(block.timestamp);
 
         vm.prank(sender);
-        vm.expectRevert(ACL.ExpirationDateBeforeOneHour.selector);
+        vm.expectRevert(ACL.ExpirationDateInThePast.selector);
         acl.delegateForUserDecryption(delegate, contractAddress, expirationDate);
     }
 
@@ -349,6 +598,21 @@ contract ACLTest is HostContractsDeployerTestUtils {
     }
 
     /**
+     * @dev Tests that the sender cannot delegate if the delegate is the wildcard contract.
+     */
+    function test_CannotDelegateIfDelegateIsWildcard(address sender, address contractAddress) public {
+        vm.assume(sender != contractAddress);
+        address wildcardDelegate = acl.WILDCARD_DELEGATION_ADDRESS();
+        vm.assume(sender != wildcardDelegate);
+        vm.assume(contractAddress != wildcardDelegate);
+        uint64 expirationDate = uint64(block.timestamp) + 7 hours;
+
+        vm.prank(sender);
+        vm.expectRevert(abi.encodeWithSelector(ACL.DelegateCannotBeWildcard.selector, wildcardDelegate));
+        acl.delegateForUserDecryption(wildcardDelegate, contractAddress, expirationDate);
+    }
+
+    /**
      * @dev Tests that the sender can revoke delegation for user decryption if the sender has already delegated.
      */
     function test_CanRevokeDelegationForUserDecryption(
@@ -359,6 +623,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
         vm.assume(sender != contractAddress);
         vm.assume(sender != delegate);
         vm.assume(delegate != contractAddress);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
 
         uint64 expirationDate = uint64(block.timestamp) + 7 hours;
         uint64 oldExpirationDate = expirationDate;
@@ -405,6 +670,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
         vm.assume(sender != contractAddress);
         vm.assume(sender != delegate);
         vm.assume(delegate != contractAddress);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
         uint64 userDecryptionDelegationCounter = 0;
 
         /// @dev Delegate user decryption for the first time.
@@ -617,6 +883,20 @@ contract ACLTest is HostContractsDeployerTestUtils {
     }
 
     /**
+     * @dev Tests that invalidation cannot be called if the contract is paused.
+     */
+    function test_CannotInvalidateDecryptionSignaturesBeforeIfPaused() public {
+        address account = _oneRandomAddress();
+
+        vm.prank(pauser);
+        acl.pause();
+
+        vm.prank(account);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        acl.invalidateDecryptionSignaturesBefore(block.timestamp);
+    }
+
+    /**
      * @dev Tests that user decryption delegation cannot be called if the contract is paused.
      */
     function test_CannotDelegateForUserDecryptionIfPaused(
@@ -627,6 +907,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
         vm.assume(sender != contractAddress);
         vm.assume(sender != delegate);
         vm.assume(delegate != contractAddress);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
 
         uint64 expirationDate = uint64(block.timestamp) + 7 hours;
 
@@ -652,6 +933,7 @@ contract ACLTest is HostContractsDeployerTestUtils {
         vm.assume(sender != contractAddress);
         vm.assume(sender != delegate);
         vm.assume(delegate != contractAddress);
+        vm.assume(delegate != acl.WILDCARD_DELEGATION_ADDRESS());
 
         uint64 expirationDate = uint64(block.timestamp) + 7 hours;
 
@@ -895,5 +1177,23 @@ contract ACLTest is HostContractsDeployerTestUtils {
         vm.prank(randomAccount);
         vm.expectRevert(abi.encodeWithSelector(ACL.SenderDenied.selector, randomAccount));
         acl.allowForDecryption(handlesList);
+    }
+
+    /**
+     * @dev Tests that a denied account can still invalidate its own decryption signatures.
+     */
+    function test_DeniedAccountCanInvalidateDecryptionSignaturesBefore() public {
+        address randomAccount = _oneRandomAddress();
+
+        vm.prank(acl.owner());
+        acl.blockAccount(randomAccount);
+
+        vm.expectEmit(address(acl));
+        emit ACLEvents.DecryptionSignaturesInvalidated(randomAccount, block.timestamp);
+
+        vm.prank(randomAccount);
+        acl.invalidateDecryptionSignaturesBefore(block.timestamp);
+
+        assertEq(acl.decryptionSignatureInvalidatedBefore(randomAccount), block.timestamp);
     }
 }

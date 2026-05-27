@@ -23,6 +23,12 @@ pub enum FhevmError {
     DeserializationError(Box<dyn std::error::Error + Sync + Send>),
     CiphertextExpansionError(tfhe::Error),
     ReRandomisationError(tfhe::Error),
+    CiphertextCompressionError(tfhe::Error),
+    CiphertextCompressionRequiresEmptyCarries,
+    CiphertextCompressionPanic {
+        message: String,
+    },
+    CannotCompressScalar,
     CiphertextExpansionUnsupportedCiphertextKind(tfhe::FheTypes),
     FheOperationOnlyOneOperandCanBeScalar {
         fhe_operation: i32,
@@ -152,6 +158,21 @@ impl std::fmt::Display for FhevmError {
             }
             Self::ReRandomisationError(e) => {
                 write!(f, "error re-randomising ciphertext: {:?}", e)
+            }
+            Self::CiphertextCompressionError(e) => {
+                write!(f, "error compressing ciphertext: {:?}", e)
+            }
+            Self::CiphertextCompressionRequiresEmptyCarries => {
+                write!(
+                    f,
+                    "cannot compress ciphertext because block carries are not empty"
+                )
+            }
+            Self::CiphertextCompressionPanic { message } => {
+                write!(f, "panic while compressing ciphertext: {}", message)
+            }
+            Self::CannotCompressScalar => {
+                write!(f, "cannot compress scalar input")
             }
             Self::CiphertextExpansionUnsupportedCiphertextKind(e) => {
                 write!(
@@ -322,6 +343,18 @@ impl std::fmt::Display for FhevmError {
     }
 }
 
+// TFHE panics with both &str and String payloads depending on call site.
+// Normalize to a stable String so callers can log and map consistently.
+fn panic_payload_to_string(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unknown panic payload".to_string()
+    }
+}
+
 #[derive(Clone)]
 pub enum SupportedFheCiphertexts {
     FheBool(tfhe::FheBool),
@@ -370,6 +403,9 @@ pub enum SupportedFheOperations {
     FheIfThenElse = 25,
     FheRand = 26,
     FheRandBounded = 27,
+    FheSum = 28,
+    FheIsIn = 29,
+    FheMulDiv = 30,
     FheGetInputCiphertext = 32,
 }
 
@@ -522,10 +558,12 @@ impl SupportedFheCiphertexts {
         }
     }
 
-    pub fn compress(&self) -> (i16, Vec<u8>) {
-        let type_num = self.type_num();
+    pub fn compress(&self) -> std::result::Result<Vec<u8>, FhevmError> {
         let mut builder = CompressedCiphertextListBuilder::new();
         match self {
+            SupportedFheCiphertexts::Scalar(_) => {
+                return Err(FhevmError::CannotCompressScalar);
+            }
             SupportedFheCiphertexts::FheBool(c) => builder.push(c.clone()),
             SupportedFheCiphertexts::FheUint4(c) => builder.push(c.clone()),
             SupportedFheCiphertexts::FheUint8(c) => builder.push(c.clone()),
@@ -538,13 +576,21 @@ impl SupportedFheCiphertexts {
             SupportedFheCiphertexts::FheBytes64(c) => builder.push(c.clone()),
             SupportedFheCiphertexts::FheBytes128(c) => builder.push(c.clone()),
             SupportedFheCiphertexts::FheBytes256(c) => builder.push(c.clone()),
-            SupportedFheCiphertexts::Scalar(_) => {
-                // TODO: Need to fix that, scalars are not ciphertexts.
-                panic!("cannot compress a scalar");
+        };
+        let list = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder.build()))
+        {
+            Ok(Ok(list)) => list,
+            Ok(Err(error)) => return Err(FhevmError::CiphertextCompressionError(error)),
+            Err(panic_payload) => {
+                let message = panic_payload_to_string(panic_payload);
+                if message == "Ciphertexts must have empty carries to be compressed" {
+                    return Err(FhevmError::CiphertextCompressionRequiresEmptyCarries);
+                }
+
+                return Err(FhevmError::CiphertextCompressionPanic { message });
             }
         };
-        let list = builder.build().expect("ciphertext compression");
-        (type_num, safe_serialize(&list))
+        Ok(safe_serialize(&list))
     }
 
     #[cfg(feature = "gpu")]
@@ -568,7 +614,7 @@ impl SupportedFheCiphertexts {
     }
 
     // Decompress without checking if enough GPU memory is available -
-    // used when GPU featre is active, but decompressing on CPU
+    // used when GPU feature is active, but decompressing on CPU
     pub fn decompress_no_memcheck(ct_type: i16, list: &[u8]) -> Result<Self> {
         let ctlist: CompressedCiphertextList = safe_deserialize(list)?;
         Self::decompress_impl(ct_type, &ctlist)
@@ -671,48 +717,6 @@ impl SupportedFheCiphertexts {
             }
             SupportedFheCiphertexts::FheBytes256(ct) => {
                 context.add_ciphertext(ct);
-            }
-            SupportedFheCiphertexts::Scalar(_) => (),
-        }
-    }
-
-    pub fn add_re_randomization_metadata(&mut self, hash_data: &[u8]) {
-        match self {
-            SupportedFheCiphertexts::FheBool(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheUint4(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheUint8(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheUint16(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheUint32(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheUint64(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheUint128(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheUint160(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheUint256(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheBytes64(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheBytes128(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
-            }
-            SupportedFheCiphertexts::FheBytes256(ct) => {
-                ct.re_randomization_metadata_mut().set_data(hash_data);
             }
             SupportedFheCiphertexts::Scalar(_) => (),
         }
@@ -831,6 +835,9 @@ impl SupportedFheOperations {
             | SupportedFheOperations::FheRand
             | SupportedFheOperations::FheRandBounded => FheOperationType::Other,
             SupportedFheOperations::FheGetInputCiphertext => FheOperationType::Other,
+            SupportedFheOperations::FheSum
+            | SupportedFheOperations::FheIsIn
+            | SupportedFheOperations::FheMulDiv => FheOperationType::Other,
         }
     }
 
@@ -852,7 +859,23 @@ impl SupportedFheOperations {
             SupportedFheOperations::FheRand
                 | SupportedFheOperations::FheRandBounded
                 | SupportedFheOperations::FheTrivialEncrypt
+                | SupportedFheOperations::FheMulDiv
         )
+    }
+
+    /// Returns `true` if the operand at `idx` is a plaintext value, `false` if it is
+    /// an encrypted ciphertext handle.
+    pub fn is_operand_scalar(&self, is_work_scalar: bool, idx: usize, _n_deps: usize) -> bool {
+        match self {
+            // All operands are plaintext.
+            SupportedFheOperations::FheRand
+            | SupportedFheOperations::FheRandBounded
+            | SupportedFheOperations::FheTrivialEncrypt => true,
+            // [lhs, rhs, divisor]: divisor is always plaintext; rhs is plaintext on the scalar path.
+            SupportedFheOperations::FheMulDiv => idx == 2 || (idx == 1 && is_work_scalar),
+            // Binary ops: rhs is plaintext on the scalar path.
+            _ => idx == 1 && is_work_scalar,
+        }
     }
 
     pub fn supports_bool_inputs(&self) -> bool {
@@ -896,7 +919,10 @@ impl SupportedFheOperations {
             | SupportedFheOperations::FheMul
             | SupportedFheOperations::FheDiv
             | SupportedFheOperations::FheRem
-            | SupportedFheOperations::FheGetInputCiphertext => false,
+            | SupportedFheOperations::FheGetInputCiphertext
+            | SupportedFheOperations::FheSum
+            | SupportedFheOperations::FheIsIn
+            | SupportedFheOperations::FheMulDiv => false,
         }
     }
 }
@@ -933,6 +959,9 @@ impl TryFrom<i16> for SupportedFheOperations {
             25 => Ok(SupportedFheOperations::FheIfThenElse),
             26 => Ok(SupportedFheOperations::FheRand),
             27 => Ok(SupportedFheOperations::FheRandBounded),
+            28 => Ok(SupportedFheOperations::FheSum),
+            29 => Ok(SupportedFheOperations::FheIsIn),
+            30 => Ok(SupportedFheOperations::FheMulDiv),
             32 => Ok(SupportedFheOperations::FheGetInputCiphertext),
             _ => Err(FhevmError::UnknownFheOperation(value as i32)),
         };
@@ -981,6 +1010,20 @@ pub fn is_ebytes_type(inp: i16) -> bool {
     (9..=11).contains(&inp)
 }
 
+#[repr(i16)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
+pub enum SchedulePriority {
+    #[default]
+    Fast = 0,
+    Slow = 1,
+}
+
+impl From<SchedulePriority> for i16 {
+    fn from(value: SchedulePriority) -> Self {
+        value as i16
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 pub enum AllowEvents {
     AllowedAccount = 0,
@@ -1009,3 +1052,40 @@ pub type BlockchainProvider = FillProvider<
     >,
     RootProvider,
 >;
+
+#[cfg(test)]
+mod tests {
+    use super::{FhevmError, SupportedFheCiphertexts, SupportedFheOperations};
+
+    #[test]
+    fn compress_scalar_returns_error() {
+        let scalar = SupportedFheCiphertexts::Scalar(vec![1, 2, 3]);
+        let compressed = scalar.compress();
+        assert!(matches!(compressed, Err(FhevmError::CannotCompressScalar)));
+    }
+
+    #[test]
+    fn is_operand_scalar_binary_add() {
+        let op = SupportedFheOperations::FheAdd;
+        // non-scalar: both operands encrypted
+        assert!(!op.is_operand_scalar(false, 0, 2));
+        assert!(!op.is_operand_scalar(false, 1, 2));
+        // scalar: only the last operand is the plaintext rhs
+        assert!(!op.is_operand_scalar(true, 0, 2));
+        assert!(op.is_operand_scalar(true, 1, 2));
+    }
+
+    #[test]
+    fn is_operand_scalar_fhe_mul_div() {
+        // [lhs(enc), rhs(enc or scalar), divisor(scalar)].
+        let op = SupportedFheOperations::FheMulDiv;
+        // Encrypted rhs path: only divisor is scalar.
+        assert!(!op.is_operand_scalar(false, 0, 3));
+        assert!(!op.is_operand_scalar(false, 1, 3));
+        assert!(op.is_operand_scalar(false, 2, 3));
+        // Scalar rhs path: rhs AND divisor are scalar.
+        assert!(!op.is_operand_scalar(true, 0, 3));
+        assert!(op.is_operand_scalar(true, 1, 3));
+        assert!(op.is_operand_scalar(true, 2, 3));
+    }
+}

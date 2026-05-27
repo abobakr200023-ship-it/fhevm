@@ -13,6 +13,8 @@ use alloy::{
 use anyhow::Context;
 use aws_config::BehaviorVersion;
 use clap::{Parser, ValueEnum};
+use fhevm_engine_common::database::{connect_pool_with_options, resolve_database_url_from_option};
+use fhevm_engine_common::drift_revert;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, Level};
@@ -45,13 +47,7 @@ struct Conf {
     ciphertext_commits_address: Address,
 
     #[arg(short, long)]
-    multichain_acl_address: Address,
-
-    #[arg(short, long)]
     gateway_url: Url,
-
-    #[arg(long)]
-    host_chain_url: Url,
 
     #[arg(short, long, value_enum, default_value = "private-key")]
     signer_type: SignerType,
@@ -79,9 +75,6 @@ struct Conf {
     #[arg(long, default_value = "event_ciphertexts_uploaded")]
     add_ciphertexts_database_channel: String,
 
-    #[arg(long, default_value = "event_allowed_handle")]
-    allow_handle_database_channel: String,
-
     #[arg(long, default_value_t = 128)]
     verify_proof_resp_batch_limit: u32,
 
@@ -93,13 +86,6 @@ struct Conf {
 
     #[arg(long, default_value_t = 10)]
     add_ciphertexts_batch_limit: u32,
-
-    #[arg(long, default_value_t = 10)]
-    allow_handle_batch_limit: u32,
-
-    // For now, use i32 as that's what we have in the DB as integer type.
-    #[arg(long, default_value_t = i32::MAX, value_parser = clap::value_parser!(i32).range(0..))]
-    allow_handle_max_retries: i32,
 
     // For now, use i32 as that's what we have in the DB as integer type.
     #[arg(long, default_value_t = i32::MAX, value_parser = clap::value_parser!(i32).range(0..))]
@@ -163,43 +149,6 @@ struct Conf {
 
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
     pub gauge_update_interval_secs: u64,
-
-    #[arg(
-        long,
-        default_value = "10",
-        help = "Delay for transmitting delegation to gateway in block number (to avoid most reorg)"
-    )]
-    pub delegation_block_delay: u64,
-
-    #[arg(
-        long,
-        default_value = "648000", // 3 months assuming 12s block time on host chain
-        help = "Clear delegation entries after N blocks (deault to 3 months)"
-    )]
-    pub delegation_clear_after_n_blocks: u64,
-
-    #[arg(
-        long,
-        default_value = "30",
-        help = "Delay for inspecting delegations without notification (in seconds)"
-    )]
-    pub delegation_fallback_polling: u64,
-
-    #[arg(
-        long,
-        default_value = "100000",
-        help = "Number of total retry before definitively stopping (retry are progressively intermittent and less frequent)"
-    )]
-    pub delegation_max_retry: u64,
-
-    #[deprecated(note = "no longer used and will be removed in future versions")]
-    #[arg(
-        long,
-        default_value_t = 0,
-        help = "Number of immediate retries when concurrent transactions failed due to nonce errors (0 to disable)",
-        hide = true
-    )]
-    pub retry_immediately_on_nonce_error: u64,
 }
 
 fn install_signal_handlers(cancel_token: CancellationToken) -> anyhow::Result<()> {
@@ -286,11 +235,11 @@ async fn main() -> anyhow::Result<()> {
 
     let conf = parse_args();
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_level(true)
-        .with_max_level(conf.log_level)
-        .init();
+    let _otel_guard = telemetry::init_tracing_otel_with_logs_only_fallback(
+        conf.log_level,
+        &conf.service_name,
+        "otlp-layer",
+    );
 
     let cancel_token = CancellationToken::new();
     install_signal_handlers(cancel_token.clone())?;
@@ -307,12 +256,6 @@ async fn main() -> anyhow::Result<()> {
             return Ok(());
         }
     };
-
-    if !conf.service_name.is_empty() {
-        if let Err(err) = telemetry::setup_otlp(&conf.service_name) {
-            error!(error = %err, "Failed to setup OTLP");
-        }
-    }
 
     let abstract_signer: AbstractSigner;
     match conf.signer_type {
@@ -354,23 +297,10 @@ async fn main() -> anyhow::Result<()> {
     };
     let gateway_provider =
         NonceManagedProvider::new(gateway_provider, Some(wallet.default_signer().address()));
-    let Ok(host_chain_provider) = get_provider(
-        &conf,
-        &conf.host_chain_url,
-        "HostChain",
-        wallet.clone(),
-        &cancel_token,
-    )
-    .await
-    else {
-        info!("Cancellation requested before host chain provider was created on startup, exiting");
-        return Ok(());
-    };
 
     let config = ConfigSettings {
         verify_proof_resp_db_channel: conf.verify_proof_resp_database_channel,
         add_ciphertexts_db_channel: conf.add_ciphertexts_database_channel,
-        allow_handle_db_channel: conf.allow_handle_database_channel,
         verify_proof_resp_batch_limit: conf.verify_proof_resp_batch_limit,
         verify_proof_resp_max_retries: conf.verify_proof_resp_max_retries,
         verify_proof_remove_after_max_retries: conf.verify_proof_remove_after_max_retries,
@@ -379,34 +309,29 @@ async fn main() -> anyhow::Result<()> {
         error_sleep_initial_secs: conf.error_sleep_initial_secs,
         error_sleep_max_secs: conf.error_sleep_max_secs,
         add_ciphertexts_max_retries: conf.add_ciphertexts_max_retries,
-        allow_handle_batch_limit: conf.allow_handle_batch_limit,
-        allow_handle_max_retries: conf.allow_handle_max_retries,
         send_txn_sync_timeout_secs: conf.send_txn_sync_timeout_secs,
         review_after_unlimited_retries: conf.review_after_unlimited_retries,
         health_check_port: conf.health_check_port,
         health_check_timeout: conf.health_check_timeout,
         gas_limit_overprovision_percent: conf.gas_limit_overprovision_percent,
         graceful_shutdown_timeout: conf.graceful_shutdown_timeout,
-        delegation_block_delay: conf.delegation_block_delay,
-        delegation_clear_after_n_blocks: conf.delegation_clear_after_n_blocks,
-        delegation_fallback_polling: conf.delegation_fallback_polling,
-        delegation_max_retry: conf.delegation_max_retry,
     };
 
-    let db_pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(conf.database_pool_size)
-        .connect(conf.database_url.unwrap_or_default().as_str())
-        .await?;
+    let database_url = resolve_database_url_from_option(conf.database_url)?;
+    let (db_pool, _pool_refresh_handle) = connect_pool_with_options(
+        &database_url,
+        sqlx::postgres::PgPoolOptions::new().max_connections(conf.database_pool_size),
+        Some(&cancel_token),
+    )
+    .await?;
 
     let transaction_sender = std::sync::Arc::new(
         TransactionSender::new(
             db_pool.clone(),
             conf.input_verification_address,
             conf.ciphertext_commits_address,
-            conf.multichain_acl_address,
             abstract_signer,
             gateway_provider,
-            host_chain_provider,
             cancel_token.clone(),
             config.clone(),
             None,
@@ -426,12 +351,18 @@ async fn main() -> anyhow::Result<()> {
         "Transaction sender and HTTP health check server starting"
     );
 
-    // Run both services in parallel. Here we assume that if transaction sender stops without an error, HTTP server should also stop.
-    let transaction_sender_fut = tokio::spawn(async move { transaction_sender.run().await });
     let http_server_fut = tokio::spawn(async move { http_server.start().await });
-
-    // Start metrics server.
     metrics_server::spawn(conf.metrics_addr.clone(), cancel_token.child_token());
+
+    drift_revert::init(
+        db_pool.clone(),
+        cancel_token.clone(),
+        None,
+        drift_revert::WatcherTimeouts::default(),
+    )
+    .await?;
+
+    let transaction_sender_fut = tokio::spawn(async move { transaction_sender.run().await });
 
     // Start gauge update routine.
     spawn_gauge_update_routine(

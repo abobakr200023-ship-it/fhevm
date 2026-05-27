@@ -8,22 +8,22 @@ use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use bytesize::ByteSize;
+use fhevm_engine_common::chain_id::ChainId;
 use fhevm_engine_common::pg_pool::{PostgresPoolManager, ServiceError};
-use fhevm_engine_common::telemetry::{self};
-use fhevm_engine_common::utils::to_hex;
+use fhevm_engine_common::{telemetry, utils::to_hex};
 use futures::future::join_all;
-use opentelemetry::global::BoxedSpan;
+use opentelemetry::trace::{Status, TraceContextExt};
 use sha3::{Digest, Keccak256};
 use sqlx::{PgPool, Pool, Postgres, Transaction};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
 use tokio::select;
 use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, error_span, info, warn, Instrument};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 // TODO: Use a config TOML to set these values
 pub const EVENT_CIPHERTEXTS_UPLOADED: &str = "event_ciphertexts_uploaded";
@@ -111,34 +111,62 @@ async fn run_uploader_loop(
                 let mut trx = pool.begin().await?;
 
                 let item = match job {
-                    UploadJob::Normal(item) =>
-                    {
+                    UploadJob::Normal(item) => {
                         item.enqueue_upload_task(&mut trx).await?;
                         item
-                    },
-                    UploadJob::DatabaseLock(item) => {
-                        if let Err(err) = sqlx::query!(
-                            "SELECT * FROM ciphertext_digest
-                                    WHERE handle = $2 AND tenant_id = $1 AND
-                                    (ciphertext128 IS NULL OR ciphertext IS NULL)
-                                    FOR UPDATE SKIP LOCKED",
-                                    item.tenant_id,
-                                    item.handle
+                    }
+                    UploadJob::DatabaseLock(mut item) => {
+                        let row = match sqlx::query!(
+                            "SELECT ciphertext, ciphertext128, ciphertext128_format
+                             FROM ciphertext_digest
+                             WHERE handle = $1 AND
+                             (ciphertext128 IS NULL OR ciphertext IS NULL)
+                             FOR UPDATE SKIP LOCKED",
+                            item.handle,
                         )
                         .fetch_one(trx.as_mut())
                         .await
                         {
-                            warn!(
-                                error = %err,
-                                handle = to_hex(&item.handle),
-                                "Failed to lock pending uploads",
-                            );
-                            trx.rollback().await?;
-                            continue;
+                            Ok(row) => row,
+                            Err(err) => {
+                                warn!(
+                                    error = %err,
+                                    handle = to_hex(&item.handle),
+                                    "Failed to lock pending uploads",
+                                );
+                                trx.rollback().await?;
+                                continue;
+                            }
+                        };
+
+                        // A non-null digest means another worker already uploaded that
+                        // ciphertext variant, so this recovery job must not retry it.
+                        if row.ciphertext.is_some() {
+                            item.ct64_compressed = Arc::new(Vec::new());
                         }
+
+                        if row.ciphertext128.is_some() {
+                            item.ct128 = Arc::new(BigCiphertext::default());
+                        } else if !item.ct128.is_empty() {
+                            item.ct128 = Arc::new(
+                                BigCiphertext::new_with_format_id(
+                                    item.ct128.bytes().to_vec(),
+                                    row.ciphertext128_format,
+                                )
+                                .ok_or_else(|| {
+                                    ExecutionError::InvalidCiphertext128Format(format!(
+                                        "pending ct128 has invalid format id, host_chain_id: {}, handle: {}, format_id: {}",
+                                        item.host_chain_id.as_i64(),
+                                        to_hex(&item.handle),
+                                        row.ciphertext128_format,
+                                    ))
+                                })?,
+                            );
+                        }
+
                         item
-                    },
-                 };
+                    }
+                };
 
 
                 debug!(handle = hex::encode(&item.handle), "Received task, handle");
@@ -165,10 +193,15 @@ async fn run_uploader_loop(
 
                 // Spawn a new task to upload the ciphertexts
                 let h = tokio::spawn(async move {
-                    let s = item.otel.child_span("upload_s3");
-                    match upload_ciphertexts(trx, item, &client, &conf).instrument(error_span!("upload_s3")).await {
+                    // Cross-boundary: spawned task; restore the OTel context
+                    // that was captured when the upload item was created.
+                    let upload_span = error_span!("upload_s3");
+                    upload_span.set_parent(item.span.context());
+                    match upload_ciphertexts(trx, item, &client, &conf)
+                        .instrument(upload_span.clone())
+                        .await
+                    {
                         Ok(()) => {
-                            telemetry::end_span(s);
                             AWS_UPLOAD_SUCCESS_COUNTER.inc();
                         }
                         Err(err) => {
@@ -178,10 +211,14 @@ async fn run_uploader_loop(
                             } else {
                                 error!(error = %err, "Failed to upload ciphertexts");
                             }
-                            telemetry::end_span_with_err(s, err.to_string());
+                            upload_span
+                                .context()
+                                .span()
+                                .set_status(Status::error(err.to_string()));
                             AWS_UPLOAD_FAILURE_COUNTER.inc();
                         }
                     }
+                    drop(upload_span);
                     drop(permit);
                 });
 
@@ -205,8 +242,8 @@ async fn run_uploader_loop(
 }
 
 enum UploadResult {
-    CtType128((Vec<u8>, BoxedSpan)),
-    CtType64((Vec<u8>, BoxedSpan)),
+    CtType128((Vec<u8>, tracing::Span)),
+    CtType64((Vec<u8>, tracing::Span)),
 }
 
 /// Uploads both 128-bit bootstrapped ciphertext and regular ciphertext to S3
@@ -228,17 +265,27 @@ async fn upload_ciphertexts(
 
     let mut jobs = vec![];
 
-    if !task.ct128.is_empty() && task.ct128.format() != Ciphertext128Format::Unknown {
+    if !task.ct128.is_empty() {
+        let ct128_format = task.ct128.format();
+        if ct128_format == Ciphertext128Format::Unknown {
+            return Err(ExecutionError::InvalidCiphertext128Format(format!(
+                "non-empty ct128 has unknown format, host_chain_id: {}, handle: {}",
+                task.host_chain_id.as_i64(),
+                handle_as_hex,
+            )));
+        }
+
         let ct128_bytes = task.ct128.bytes();
         let ct128_digest = compute_digest(ct128_bytes);
         info!(
             handle = handle_as_hex,
             len = ?ByteSize::b(ct128_bytes.len() as u64),
-            tenant_id = task.tenant_id,
+            format = %ct128_format,
+            host_chain_id = task.host_chain_id.as_i64(),
             "Uploading ct128"
         );
 
-        let format_as_str = task.ct128.format().to_string();
+        let format_as_str = ct128_format.to_string();
 
         let key = if cfg!(feature = "test_s3_use_handle_as_key") {
             hex::encode(&task.handle)
@@ -248,15 +295,34 @@ async fn upload_ciphertexts(
             hex::encode(&ct128_digest)
         };
 
-        let mut s = task.otel.child_span("ct128_check_s3");
-        let exists = check_object_exists(client, &conf.bucket_ct128, &key).await?;
-        telemetry::attribute(&mut s, "exists", exists.to_string());
-        telemetry::end_span(s);
+        let ct128_check_span = tracing::info_span!(
+            "ct128_check_s3",
+            ct_type = "ct128",
+            exists = tracing::field::Empty,
+        );
+        let exists = match check_object_exists(client, &conf.bucket_ct128, &key)
+            .instrument(ct128_check_span.clone())
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                ct128_check_span
+                    .context()
+                    .span()
+                    .set_status(Status::error(err.to_string()));
+                return Err(err);
+            }
+        };
+        ct128_check_span.record("exists", tracing::field::display(exists));
+        drop(ct128_check_span);
 
         if !exists {
-            let mut span: BoxedSpan = task.otel.child_span("ct128_upload_s3");
-            telemetry::attribute(&mut span, "len", ct128_bytes.len().to_string());
-            telemetry::attribute(&mut span, "format", format_as_str.to_owned());
+            let ct128_upload_span = tracing::info_span!(
+                "ct128_upload_s3",
+                ct_type = "ct128",
+                format = %format_as_str,
+                len = ct128_bytes.len(),
+            );
 
             jobs.push((
                 client
@@ -265,8 +331,9 @@ async fn upload_ciphertexts(
                     .metadata("Ct-Format", format_as_str)
                     .key(key)
                     .body(ByteStream::from(ct128_bytes.to_vec()))
-                    .send(),
-                UploadResult::CtType128((ct128_digest.clone(), span)),
+                    .send()
+                    .instrument(ct128_upload_span.clone()),
+                UploadResult::CtType128((ct128_digest.clone(), ct128_upload_span)),
             ));
         } else {
             info!(
@@ -286,7 +353,6 @@ async fn upload_ciphertexts(
         info!(
             handle = handle_as_hex,
             len = ?ByteSize::b(ct64_compressed.len() as u64),
-            tenant_id = task.tenant_id,
             "Uploading ct64",
         );
 
@@ -300,14 +366,33 @@ async fn upload_ciphertexts(
             hex::encode(&ct64_digest)
         };
 
-        let mut s = task.otel.child_span("ct64_check_s3");
-        let exists = check_object_exists(client, &conf.bucket_ct64, &key).await?;
-        telemetry::attribute(&mut s, "exists", exists.to_string());
-        telemetry::end_span(s);
+        let ct64_check_span = tracing::info_span!(
+            "ct64_check_s3",
+            ct_type = "ct64",
+            exists = tracing::field::Empty,
+        );
+        let exists = match check_object_exists(client, &conf.bucket_ct64, &key)
+            .instrument(ct64_check_span.clone())
+            .await
+        {
+            Ok(v) => v,
+            Err(err) => {
+                ct64_check_span
+                    .context()
+                    .span()
+                    .set_status(Status::error(err.to_string()));
+                return Err(err);
+            }
+        };
+        ct64_check_span.record("exists", tracing::field::display(exists));
+        drop(ct64_check_span);
 
         if !exists {
-            let mut span = task.otel.child_span("ct64_upload_s3");
-            telemetry::attribute(&mut span, "len", ct64_compressed.len().to_string());
+            let ct64_upload_span = tracing::info_span!(
+                "ct64_upload_s3",
+                ct_type = "ct64",
+                len = ct64_compressed.len(),
+            );
 
             jobs.push((
                 client
@@ -315,8 +400,9 @@ async fn upload_ciphertexts(
                     .bucket(conf.bucket_ct64.clone())
                     .key(key)
                     .body(ByteStream::from(ct64_compressed.clone()))
-                    .send(),
-                UploadResult::CtType64((ct64_digest.clone(), span)),
+                    .send()
+                    .instrument(ct64_upload_span.clone()),
+                UploadResult::CtType64((ct64_digest.clone(), ct64_upload_span)),
             ));
         } else {
             info!(
@@ -332,15 +418,15 @@ async fn upload_ciphertexts(
     }
 
     // Execute all uploads and collect results with their IDs
-    let results: Vec<(Result<_, _>, UploadResult, SystemTime)> = join_all(
+    let results: Vec<(Result<_, _>, UploadResult)> = join_all(
         jobs.into_iter()
-            .map(|(fut, upload)| async move { (fut.await, upload, SystemTime::now()) }),
+            .map(|(fut, upload)| async move { (fut.await, upload) }),
     )
     .await;
 
     let mut transient_error: Option<ExecutionError> = None;
 
-    for (ct_variant, result, finish_time) in results {
+    for (ct_variant, result) in results {
         match result {
             UploadResult::CtType128((digest, span)) => {
                 if let Err(err) = ct_variant {
@@ -350,11 +436,14 @@ async fn upload_ciphertexts(
                         "Failed to upload ct128",
                     );
 
-                    telemetry::end_span_with_err(span, err.to_string());
+                    span.context()
+                        .span()
+                        .set_status(Status::error(err.to_string()));
+                    drop(span);
                     transient_error = Some(ExecutionError::S3TransientError(err.to_string()));
                 } else {
+                    drop(span);
                     task.update_ct128_uploaded(&mut trx, digest).await?;
-                    telemetry::end_span_with_timestamp(span, finish_time);
                 }
             }
             UploadResult::CtType64((digest, span)) => {
@@ -365,11 +454,14 @@ async fn upload_ciphertexts(
                         "Failed to upload ct64"
                     );
 
-                    telemetry::end_span_with_err(span, err.to_string());
+                    span.context()
+                        .span()
+                        .set_status(Status::error(err.to_string()));
+                    drop(span);
                     transient_error = Some(ExecutionError::S3TransientError(err.to_string()));
                 } else {
+                    drop(span);
                     task.update_ct64_uploaded(&mut trx, digest).await?;
-                    telemetry::end_span_with_timestamp(span, finish_time);
                 }
             }
         }
@@ -400,7 +492,7 @@ async fn fetch_pending_uploads(
     limit: i64,
 ) -> Result<Vec<UploadJob>, ExecutionError> {
     let rows = sqlx::query!(
-        "SELECT tenant_id, handle, ciphertext, ciphertext128, ciphertext128_format, transaction_id 
+        "SELECT handle, ciphertext, ciphertext128, ciphertext128_format, transaction_id, host_chain_id, key_id_gw
         FROM ciphertext_digest 
         WHERE ciphertext IS NULL OR ciphertext128 IS NULL
         FOR UPDATE SKIP LOCKED
@@ -423,8 +515,7 @@ async fn fetch_pending_uploads(
         // Fetch missing ciphertext
         if ciphertext_digest.is_none() {
             if let Ok(row) = sqlx::query!(
-                "SELECT ciphertext FROM ciphertexts WHERE tenant_id = $1 AND handle = $2;",
-                row.tenant_id,
+                "SELECT ciphertext FROM ciphertexts WHERE handle = $1;",
                 handle
             )
             .fetch_optional(db_pool)
@@ -441,8 +532,7 @@ async fn fetch_pending_uploads(
         // Fetch missing ciphertext128
         if ciphertext128_digest.is_none() {
             if let Ok(row) = sqlx::query!(
-                "SELECT ciphertext FROM ciphertexts128 WHERE tenant_id = $1 AND handle = $2;",
-                row.tenant_id,
+                "SELECT ciphertext FROM ciphertexts128 WHERE handle = $1;",
                 handle
             )
             .fetch_optional(db_pool)
@@ -467,7 +557,14 @@ async fn fetch_pending_uploads(
 
         let ct128 = if !is_ct128_empty {
             match BigCiphertext::new_with_format_id(ct128, row.ciphertext128_format) {
-                Some(ct) => ct,
+                Some(ct) => {
+                    info!(
+                        handle = to_hex(&handle),
+                        format = %ct.format(),
+                        "Recovered pending ct128 upload from DB"
+                    );
+                    ct
+                }
                 None => {
                     error!(
                         handle = to_hex(&handle),
@@ -483,12 +580,25 @@ async fn fetch_pending_uploads(
         };
 
         if !ct64_compressed.is_empty() || !is_ct128_empty {
+            let recovery_span = tracing::info_span!(
+                "recovery_task",
+                txn_id = tracing::field::Empty,
+                handle = tracing::field::Empty
+            );
+            telemetry::record_short_hex(&recovery_span, "handle", &handle);
+            telemetry::record_short_hex_if_some(
+                &recovery_span,
+                "txn_id",
+                transaction_id.as_deref(),
+            );
             let item = HandleItem {
-                tenant_id: row.tenant_id,
+                host_chain_id: ChainId::try_from(row.host_chain_id)
+                    .map_err(|e| ExecutionError::ConversionError(e.into()))?,
+                key_id_gw: row.key_id_gw,
                 handle: handle.clone(),
                 ct64_compressed,
                 ct128: Arc::new(ct128),
-                otel: telemetry::tracer_with_handle("recovery_task", handle, &transaction_id),
+                span: recovery_span,
                 transaction_id,
             };
 

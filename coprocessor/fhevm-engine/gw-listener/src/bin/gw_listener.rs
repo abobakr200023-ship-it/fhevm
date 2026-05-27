@@ -3,16 +3,37 @@ use std::time::Duration;
 use alloy::providers::{ProviderBuilder, WsConnect};
 use alloy::{primitives::Address, transports::http::reqwest::Url};
 use clap::Parser;
-use fhevm_engine_common::{metrics_server, telemetry, utils::DatabaseURL};
-use gw_listener::aws_s3::AwsS3Client;
-use gw_listener::chain_id_from_env;
+use fhevm_engine_common::database::{connect_pool_with_options, resolve_database_url_from_option};
+use fhevm_engine_common::{
+    drift_revert::{
+        self, RevertRunnerConfig, WatcherTimeouts, DRIFT_REVERT_DB_DOWN_LIMIT,
+        MIN_GRACE_PERIOD_MULTIPLIER,
+    },
+    metrics_server, telemetry,
+    utils::DatabaseURL,
+};
 use gw_listener::gw_listener::GatewayListener;
 use gw_listener::http_server::HttpServer;
 use gw_listener::ConfigSettings;
 use humantime::parse_duration;
+use sqlx::postgres::PgPoolOptions;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, Level};
+
+/// Parse `drift_auto_revert_grace_period` and reject values below
+/// `MIN_GRACE_PERIOD_MULTIPLIER * DRIFT_REVERT_DB_DOWN_LIMIT`.
+fn parse_grace_period(s: &str) -> Result<Duration, String> {
+    let d = parse_duration(s).map_err(|e| e.to_string())?;
+    let min = DRIFT_REVERT_DB_DOWN_LIMIT * MIN_GRACE_PERIOD_MULTIPLIER;
+    if d < min {
+        return Err(format!(
+            "must be at least {}x DRIFT_REVERT_DB_DOWN_LIMIT ({:?}) = {:?}, got {:?}",
+            MIN_GRACE_PERIOD_MULTIPLIER, DRIFT_REVERT_DB_DOWN_LIMIT, min, d,
+        ));
+    }
+    Ok(d)
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about, long_about = None)]
@@ -31,9 +52,6 @@ struct Conf {
 
     #[arg(short, long)]
     input_verification_address: Address,
-
-    #[arg(long)]
-    kms_generation_address: Address,
 
     #[arg(long, default_value_t = 1)]
     error_sleep_initial_secs: u16,
@@ -63,9 +81,6 @@ struct Conf {
         default_value_t = Level::INFO)]
     log_level: Level,
 
-    #[arg(long)]
-    host_chain_id: Option<u64>,
-
     #[arg(long, default_value = "500ms", value_parser = parse_duration)]
     get_logs_poll_interval: Duration,
 
@@ -79,8 +94,55 @@ struct Conf {
     #[arg(long, env = "OTEL_SERVICE_NAME", default_value = "gw-listener")]
     pub service_name: String,
 
-    #[arg(long, default_value = None, help = "Can be negative from last processed block", allow_hyphen_values = true, alias = "catchup-kms-generation-from-block")]
-    pub replay_from_block: Option<i64>,
+    #[arg(
+        long,
+        requires = "gateway_config_address",
+        help = "CiphertextCommits contract address for drift detection"
+    )]
+    ciphertext_commits_address: Option<Address>,
+
+    #[arg(
+        long,
+        requires = "ciphertext_commits_address",
+        help = "GatewayConfig contract address used to fetch coprocessor tx-senders"
+    )]
+    gateway_config_address: Option<Address>,
+
+    /// How long to wait for the gateway to emit a consensus event after the
+    /// first submission is seen. Wall-clock duration — the default of 5 minutes
+    /// accommodates coprocessors that may be stuck for a few minutes.
+    #[arg(long, default_value = "5m", value_parser = parse_duration, requires = "ciphertext_commits_address")]
+    drift_no_consensus_timeout: Duration,
+
+    /// After consensus, how many additional blocks to wait for remaining
+    /// coprocessors to submit their ciphertext material. Wall-clock duration.
+    #[arg(long, default_value = "5m", value_parser = parse_duration, requires = "ciphertext_commits_address")]
+    drift_post_consensus_grace: Duration,
+
+    /// How long to wait after detecting a pending drift-revert signal before
+    /// running the revert SQL. Gives other services time to see the signal
+    /// and re-exec (or fail-fast and be restarted) before the DB state
+    /// changes. Must be ≥ `MIN_GRACE_PERIOD_MULTIPLIER * DRIFT_REVERT_DB_DOWN_LIMIT`;
+    /// the service refuses to start otherwise.
+    #[arg(long, default_value = "120s", value_parser = parse_grace_period)]
+    drift_auto_revert_grace_period: Duration,
+
+    /// Enable automatic drift recovery. When false (default), the drift
+    /// detector still runs and logs drift, but no revert signal is created
+    /// and no automatic recovery kicks in. Opt-in while the feature rolls out.
+    /// Also readable from `DRIFT_AUTO_REVERT_ENABLED` env var.
+    #[arg(long, env = "DRIFT_AUTO_REVERT_ENABLED", default_value_t = false)]
+    drift_auto_revert_enabled: bool,
+
+    /// Maximum number of successful reverts allowed for a host chain within
+    /// `--drift-auto-revert-recent-attempts-window` before refusing further
+    /// reverts. Catches loops where each revert succeeds but drift recurs.
+    #[arg(long, default_value_t = 2)]
+    drift_auto_revert_max_recent_attempts: u32,
+
+    /// Time window over which `--drift-auto-revert-max-recent-attempts` is counted.
+    #[arg(long, default_value = "30m", value_parser = parse_duration)]
+    drift_auto_revert_recent_attempts_window: Duration,
 }
 
 fn install_signal_handlers(cancel_token: CancellationToken) -> anyhow::Result<()> {
@@ -102,17 +164,11 @@ async fn main() -> anyhow::Result<()> {
 
     let conf = Conf::parse();
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_level(true)
-        .with_max_level(conf.log_level)
-        .init();
-
-    if !conf.service_name.is_empty() {
-        if let Err(err) = telemetry::setup_otlp(&conf.service_name) {
-            error!(error = %err, "Failed to setup OTLP");
-        }
-    }
+    let _otel_guard = telemetry::init_tracing_otel_with_logs_only_fallback(
+        conf.log_level,
+        &conf.service_name,
+        "otlp-layer",
+    );
 
     info!(gateway_url = %conf.gw_url, max_retries = %conf.provider_max_retries,
          retry_interval = ?conf.provider_retry_interval, "Connecting to Gateway");
@@ -142,16 +198,10 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let aws_s3_client = AwsS3Client {};
-
     let cancel_token = CancellationToken::new();
 
-    let Some(host_chain_id) = conf.host_chain_id.or_else(chain_id_from_env) else {
-        anyhow::bail!("--host-chain-id or CHAIN_ID env var is missing.")
-    };
     let config = ConfigSettings {
-        host_chain_id,
-        database_url: conf.database_url.clone().unwrap_or_default(),
+        database_url: resolve_database_url_from_option(conf.database_url.clone())?,
         database_pool_size: conf.database_pool_size,
         verify_proof_req_db_channel: conf.verify_proof_req_database_channel,
         gw_url: conf.gw_url,
@@ -161,21 +211,21 @@ async fn main() -> anyhow::Result<()> {
         health_check_timeout: conf.health_check_timeout,
         get_logs_poll_interval: conf.get_logs_poll_interval,
         get_logs_block_batch_size: conf.get_logs_block_batch_size,
-        replay_from_block: conf.replay_from_block,
         log_last_processed_every_number_of_updates: conf.log_last_processed_every_number_of_updates,
+        ciphertext_commits_address: conf.ciphertext_commits_address,
+        gateway_config_address: conf.gateway_config_address,
+        drift_no_consensus_timeout: conf.drift_no_consensus_timeout,
+        drift_post_consensus_grace: conf.drift_post_consensus_grace,
+        drift_auto_revert_grace_period: conf.drift_auto_revert_grace_period,
+        drift_auto_revert_enabled: conf.drift_auto_revert_enabled,
     };
 
-    let gw_listener = GatewayListener::new(
+    let gw_listener = std::sync::Arc::new(GatewayListener::new(
         conf.input_verification_address,
-        conf.kms_generation_address,
         config.clone(),
         cancel_token.clone(),
         provider.clone(),
-        aws_s3_client.clone(),
-    );
-
-    // Wrap the GatewayListener in an Arc
-    let gw_listener = std::sync::Arc::new(gw_listener);
+    ));
 
     let http_server = HttpServer::new(
         gw_listener.clone(),
@@ -185,17 +235,35 @@ async fn main() -> anyhow::Result<()> {
 
     install_signal_handlers(cancel_token.clone())?;
 
+    let http_server_fut = tokio::spawn(async move { http_server.start().await });
+    metrics_server::spawn(conf.metrics_addr.clone(), cancel_token.child_token());
+
     info!(
         health_check_port = conf.health_check_port,
         "Starting HTTP health check server"
     );
 
-    // Run both services in parallel. Here we assume that if gw listener stops without an error, HTTP server should also stop.
-    let gw_listener_fut = tokio::spawn(async move { gw_listener.run().await });
-    let http_server_fut = tokio::spawn(async move { http_server.start().await });
+    let (db_pool, _pool_refresh_handle) = connect_pool_with_options(
+        &config.database_url,
+        PgPoolOptions::new().max_connections(config.database_pool_size),
+        Some(&cancel_token),
+    )
+    .await?;
 
-    // Start the metrics server.
-    metrics_server::spawn(conf.metrics_addr.clone(), cancel_token.child_token());
+    // gw-listener is the revert runner — it runs the revert SQL if pending.
+    drift_revert::init(
+        db_pool.clone(),
+        cancel_token.clone(),
+        Some(RevertRunnerConfig {
+            grace_period: config.drift_auto_revert_grace_period,
+            max_recent_attempts: conf.drift_auto_revert_max_recent_attempts,
+            recent_attempts_window: conf.drift_auto_revert_recent_attempts_window,
+        }),
+        WatcherTimeouts::default(),
+    )
+    .await?;
+
+    let gw_listener_fut = tokio::spawn(async move { gw_listener.run(db_pool).await });
 
     let gw_listener_res = gw_listener_fut.await;
     let http_server_res = http_server_fut.await;
@@ -212,4 +280,47 @@ async fn main() -> anyhow::Result<()> {
     info!("Gateway listener and HTTP health check server stopped gracefully");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_grace_period_accepts_exactly_min() {
+        let min = DRIFT_REVERT_DB_DOWN_LIMIT * MIN_GRACE_PERIOD_MULTIPLIER;
+        let s = format!("{}s", min.as_secs());
+        let parsed = parse_grace_period(&s).expect("min must be accepted");
+        assert_eq!(parsed, min);
+    }
+
+    #[test]
+    fn parse_grace_period_accepts_above_min() {
+        let min = DRIFT_REVERT_DB_DOWN_LIMIT * MIN_GRACE_PERIOD_MULTIPLIER;
+        let above = min + Duration::from_secs(1);
+        let s = format!("{}s", above.as_secs());
+        assert_eq!(parse_grace_period(&s).unwrap(), above);
+    }
+
+    #[test]
+    fn parse_grace_period_rejects_below_min() {
+        let min = DRIFT_REVERT_DB_DOWN_LIMIT * MIN_GRACE_PERIOD_MULTIPLIER;
+        let below = min - Duration::from_secs(1);
+        let s = format!("{}s", below.as_secs());
+        let err = parse_grace_period(&s).expect_err("below min must be rejected");
+        assert!(
+            err.contains("must be at least"),
+            "error should explain the lower bound, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_grace_period_rejects_invalid_duration() {
+        let err = parse_grace_period("not-a-duration").expect_err("must reject garbage");
+        // Surfaces the humantime parse error rather than the bound check.
+        assert!(
+            !err.contains("must be at least"),
+            "invalid duration should not surface bound-check error, got: {err}"
+        );
+    }
 }

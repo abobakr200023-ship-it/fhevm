@@ -12,6 +12,19 @@ gateway_chain_id = 54321
 # ENV: KMS_CONNECTOR_GATEWAY_URL
 gateway_url = "http://localhost:8545"
 
+# Ethereum RPC node endpoint (required)
+# ENV: KMS_CONNECTOR_ETHEREUM_URL
+ethereum_url = "http://localhost:8545"
+
+# Chain ID for the Ethereum network (required)
+# ENV: KMS_CONNECTOR_ETHEREUM_CHAIN_ID
+ethereum_chain_id = 11155111
+
+# Address of the KMS verifier contract (required)
+# Format: hex string with 0x prefix
+# ENV: KMS_CONNECTOR_KMS_VERIFIER_ADDRESS
+kms_verifier_address = "0x0000000000000000000000000000000000000000"
+
 # URL of the KMS Connector internal database (required)
 # Format: see https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING-URIS
 # ENV: KMS_CONNECTOR_DATABASE_URL
@@ -29,13 +42,21 @@ database_url = "postgres://postgres:postgres@localhost/kms-connector"
 # ENV: KMS_CONNECTOR_TASK_LIMIT
 # task_limit = 1000
 
-# The polling interval for decryption requests (optional, defaults to 1s)
+# The polling interval for decryption requests (optional, defaults to 500ms)
 # ENV: KMS_CONNECTOR_DECRYPTION_POLLING (format: https://docs.rs/humantime/latest/humantime/)
-# decryption_polling = "1s"
+# decryption_polling = "500ms"
 
 # The polling interval for key management requests (optional, defaults to 30s)
 # ENV: KMS_CONNECTOR_KMS_GENERATION_POLLING (format: https://docs.rs/humantime/latest/humantime/)
 # key_management_polling = "30s"
+
+# Maximum number of blocks per eth_getLogs RPC call (optional, defaults to 100)
+# ENV: KMS_CONNECTOR_GET_LOGS_BATCH_SIZE
+# get_logs_batch_size = 100
+
+# Maximum consecutive polling errors before the listener stops (optional, defaults to 20)
+# ENV: KMS_CONNECTOR_MAX_CONSECUTIVE_POLLING_ERRORS
+# max_consecutive_polling_errors = 20
 
 # Block number to start processing decryption events from (optional, defaults to latest block if not set)
 # ENV: KMS_CONNECTOR_DECRYPTION_FROM_BLOCK_NUMBER

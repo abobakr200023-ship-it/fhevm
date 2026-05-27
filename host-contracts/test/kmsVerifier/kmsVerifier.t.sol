@@ -1,63 +1,59 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 pragma solidity ^0.8.24;
 
-import {Test} from "forge-std/Test.sol";
+import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import {UnsafeUpgrades} from "@openzeppelin/foundry-upgrades/src/Upgrades.sol";
-import {OwnableUpgradeable} from "@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol";
 import {MessageHashUtils} from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
-import {KMSVerifier} from "../../contracts/KMSVerifier.sol";
-import {ACL} from "../../contracts/ACL.sol";
+import {HostContractsDeployerTestUtils} from "@fhevm-foundry/HostContractsDeployerTestUtils.sol";
+import {KMSVerifier} from "@fhevm-host-contracts/contracts/KMSVerifier.sol";
+import {ProtocolConfig} from "@fhevm-host-contracts/contracts/ProtocolConfig.sol";
+import {KMSGeneration} from "@fhevm-host-contracts/contracts/KMSGeneration.sol";
+import {IProtocolConfig} from "@fhevm-host-contracts/contracts/interfaces/IProtocolConfig.sol";
+import {KmsNode} from "@fhevm-host-contracts/contracts/shared/Structs.sol";
 import {EmptyUUPSProxy} from "../../contracts/emptyProxy/EmptyUUPSProxy.sol";
-import {fhevmExecutorAdd} from "../../addresses/FHEVMHostAddresses.sol";
+import {KMS_CONTEXT_COUNTER_BASE} from "@fhevm-host-contracts/contracts/shared/Constants.sol";
 import {ACLOwnable} from "../../contracts/shared/ACLOwnable.sol";
-import {aclAdd} from "../../addresses/FHEVMHostAddresses.sol";
 
-contract KMSVerifierTest is Test {
+contract KMSVerifierTest is HostContractsDeployerTestUtils {
     KMSVerifier internal kmsVerifier;
+    ProtocolConfig internal protocolConfig;
+    KMSGeneration internal kmsGeneration;
 
-    uint256 internal constant initialThreshold = 1;
     address internal constant verifyingContractSource = address(10000);
     address internal constant owner = address(456);
 
     /// @dev Signer variables.
-    uint256 internal constant privateKeySigner0 = 0x022;
-    uint256 internal constant privateKeySigner1 = 0x03;
-    uint256 internal constant privateKeySigner2 = 0x04;
-    uint256 internal constant privateKeySigner3 = 0x05;
-    uint256 internal constant privateKeySigner4 = 0x06;
-    address[] internal activeSigners;
+    uint256 internal constant privateKeySigner0 = 0x100;
+    uint256 internal constant privateKeySigner1 = 0x200;
+    uint256 internal constant privateKeySigner2 = 0x300;
+    uint256 internal constant privateKeySigner3 = 0x400;
 
-    mapping(address => uint256) internal signerPrivateKeys;
     address internal signer0;
     address internal signer1;
     address internal signer2;
     address internal signer3;
-    address internal signer4;
 
-    /// @dev Proxy and implementation variables
     address internal proxy;
-    address internal implementation;
 
-    /**
-     * @dev Computes the signature for a given digest using the provided private key.
-     * @param privateKey The private key used to sign the digest.
-     * @param digest The hash of the data to be signed.
-     * @return signature The computed signature as a byte array, encoded as {r}{s}{v}.
-     */
-    function _computeSignature(uint256 privateKey, bytes32 digest) internal pure returns (bytes memory signature) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
-        return abi.encodePacked(r, s, v);
+    function setUp() public {
+        signer0 = vm.addr(privateKeySigner0);
+        signer1 = vm.addr(privateKeySigner1);
+        signer2 = vm.addr(privateKeySigner2);
+        signer3 = vm.addr(privateKeySigner3);
+
+        _deployACL(owner);
+        (protocolConfig, ) = _deployProtocolConfig(owner, _makeKmsNodes(3), _defaultThresholds());
+        (kmsGeneration, ) = _deployKMSGeneration(owner);
+
+        (kmsVerifier, ) = _deployKMSVerifier(owner, verifyingContractSource, uint64(block.chainid));
+        proxy = address(kmsVerifier);
     }
 
-    /**
-     * @dev Computes the digest of the given handles list and decrypted result.
-     * This function uses the EIP-712 encoding scheme to hash the data.
-     *
-     * @param handlesList An array of bytes32 representing the handles.
-     * @param decryptedResult A bytes array containing the decrypted result.
-     * @return A bytes32 hash representing the computed digest.
-     */
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
     function _computeDigest(
         bytes32[] memory handlesList,
         bytes memory decryptedResult,
@@ -72,19 +68,9 @@ contract KMSVerifierTest is Test {
             )
         );
 
-        bytes32 hashTypeData = MessageHashUtils.toTypedDataHash(_computeDomainSeparator(), structHash);
-        return hashTypeData;
+        return MessageHashUtils.toTypedDataHash(_computeDomainSeparator(), structHash);
     }
 
-    /**
-     * @dev Computes the EIP-712 domain separator.
-     * This function retrieves the domain parameters from the `kmsVerifier` contract,
-     * including the name, version, chain ID, and verifying contract address.
-     * It then encodes these parameters and hashes them using the keccak256 algorithm
-     * to produce the domain separator.
-     *
-     * @return bytes32 The computed domain separator.
-     */
     function _computeDomainSeparator() internal view returns (bytes32) {
         (, string memory name, string memory version, uint256 chainId, address verifyingContract, , ) = kmsVerifier
             .eip712Domain();
@@ -101,305 +87,114 @@ contract KMSVerifierTest is Test {
             );
     }
 
-    /**
-     * @dev Internal function to deploy a UUPS proxy contract.
-     * The proxy is deployed using the UnsafeUpgrades library and initialized with the owner address.
-     */
-    function _deployProxy() internal {
-        proxy = UnsafeUpgrades.deployUUPSProxy(
-            address(new EmptyUUPSProxy()),
-            abi.encodeCall(EmptyUUPSProxy.initialize, ())
-        );
-    }
-
-    /**
-     * @dev Internal function to deploy and etch ACL contract at expected constant address.
-     * Also stores `owner` as ACL's owner, this is needed for ownership of core contracts.
-     */
-    function _deployAndEtchACL() internal {
-        address _acl = address(new ACL());
-        bytes memory code = _acl.code;
-        vm.etch(aclAdd, code);
-        vm.store(
-            aclAdd,
-            0x9016d09d72d40fdae2fd8ceac6b6234c7706214fd39c1cd1e609a0528c199300, // OwnableStorageLocation
-            bytes32(uint256(uint160(owner)))
-        );
-    }
-
-    /**
-     * @dev Internal function to upgrade the deployed proxy to a new implementation.
-     * The new implementation is an instance of the KMSVerifier contract.
-     * The proxy is upgraded using the UnsafeUpgrades library and the owner address.
-     */
-    function _upgradeProxy(address[] memory signers) internal {
-        implementation = address(new KMSVerifier());
-        UnsafeUpgrades.upgradeProxy(
-            proxy,
-            implementation,
-            abi.encodeCall(
-                kmsVerifier.initializeFromEmptyProxy,
-                (verifyingContractSource, uint64(block.chainid), signers, initialThreshold)
-            ),
-            owner
-        );
-        kmsVerifier = KMSVerifier(proxy);
-    }
-
-    /**
-     * @dev Upgrades the proxy with a specified number of signers (1-5).
-     * Adds signers (signer0 to signer4) to `activeSigners` based on `numberSigners`.
-     * Calls `_upgradeProxy` with the updated `activeSigners`.
-     *
-     * @param numberSigners Number of signers (1-5).
-     */
-    function _upgradeProxyWithSigners(uint256 numberSigners) internal {
-        assert(numberSigners > 0 && numberSigners < 6);
-
-        if (numberSigners >= 1) {
-            activeSigners.push(signer0);
-        }
-        if (numberSigners >= 2) {
-            activeSigners.push(signer1);
-        }
-        if (numberSigners >= 3) {
-            activeSigners.push(signer2);
-        }
-        if (numberSigners >= 4) {
-            activeSigners.push(signer3);
-        }
-        if (numberSigners == 5) {
-            activeSigners.push(signer4);
-        }
-
-        _upgradeProxy(activeSigners);
-    }
-
-    function _generateMockHandlesList(uint256 numberHandles) internal pure returns (bytes32[] memory) {
+    function _generateMockHandlesList(uint256 numberHandles) internal pure returns (bytes32[] memory handlesList) {
         assert(numberHandles < 250);
-        bytes32[] memory handlesList = new bytes32[](numberHandles);
+        handlesList = new bytes32[](numberHandles);
         for (uint256 i = 0; i < numberHandles; i++) {
             handlesList[i] = bytes32(uint256(i + 1));
         }
-        return handlesList;
     }
 
-    /**
-     * @dev Initializes signer addresses and maps them to their private keys.
-     */
-    function _initializeSigners() internal {
-        signer0 = vm.addr(privateKeySigner0);
-        signer1 = vm.addr(privateKeySigner1);
-        signer2 = vm.addr(privateKeySigner2);
-        signer3 = vm.addr(privateKeySigner3);
-        signer4 = vm.addr(privateKeySigner4);
-
-        signerPrivateKeys[signer0] = privateKeySigner0;
-        signerPrivateKeys[signer1] = privateKeySigner1;
-        signerPrivateKeys[signer2] = privateKeySigner2;
-        signerPrivateKeys[signer3] = privateKeySigner3;
-        signerPrivateKeys[signer4] = privateKeySigner4;
+    function _mockDecryptedResult() internal pure returns (bytes memory) {
+        return abi.encodePacked(keccak256("test"));
     }
 
-    /**
-     * @dev Sets up the testing environment by deploying a proxy contract and initializing signers.
-     * This function is executed before each test to ensure a consistent and isolated state.
-     */
-    function setUp() public {
-        _deployProxy();
-        _deployAndEtchACL();
-        _initializeSigners();
+    function _buildSingleSignerProof(
+        uint256 signerKey,
+        bytes memory extraData
+    ) internal view returns (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) {
+        handlesList = _generateMockHandlesList(3);
+        decryptedResult = _mockDecryptedResult();
+        bytes32 digest = _computeDigest(handlesList, decryptedResult, extraData);
+        bytes memory signature = _computeSignature(signerKey, digest);
+        proof = abi.encodePacked(uint8(1), signature, extraData);
     }
 
-    /**
-     * @dev Tests that the post-upgrade check for the proxy contract works as expected.
-     * It verifies that the version and threshold are set correctly after the upgrade.
-     */
+    function _makeSingleSignerList(address signer) internal pure returns (address[] memory signers) {
+        signers = new address[](1);
+        signers[0] = signer;
+    }
+
+    function _setupHistoricalAndCurrentContexts() internal returns (uint256 historicalCtx, uint256 currentCtx) {
+        historicalCtx = kmsVerifier.getCurrentKmsContextId();
+
+        address[] memory newSigners = _makeSingleSignerList(signer3);
+        vm.prank(owner);
+        protocolConfig.defineNewKmsContext(_makeKmsNodesFromSigners(newSigners), _defaultThresholds());
+        currentCtx = protocolConfig.getCurrentKmsContextId();
+    }
+
+    function _rotateToThresholdTwoContext() internal {
+        IProtocolConfig.KmsThresholds memory thresholds = _defaultThresholds();
+        thresholds.publicDecryption = 2;
+
+        vm.prank(owner);
+        protocolConfig.defineNewKmsContext(_makeKmsNodes(3), thresholds);
+        assertEq(protocolConfig.getPublicDecryptionThreshold(), 2);
+    }
+
+    function _assertCurrentContextDelegatesToProtocolConfig() internal view {
+        uint256 currentCtx = protocolConfig.getCurrentKmsContextId();
+        assertEq(kmsVerifier.getCurrentKmsContextId(), currentCtx);
+        assertEq(kmsVerifier.getKmsSigners(), protocolConfig.getKmsSignersForContext(currentCtx));
+    }
+
+    // -----------------------------------------------------------------------
+    // Tests
+    // -----------------------------------------------------------------------
+
     function test_PostProxyUpgradeCheck() public {
-        uint256 numberSigners = 3;
-        _upgradeProxyWithSigners(numberSigners);
-        assertEq(kmsVerifier.getVersion(), string(abi.encodePacked("KMSVerifier v0.1.0")));
-        assertEq(kmsVerifier.getThreshold(), initialThreshold);
+        assertEq(kmsVerifier.getVersion(), "KMSVerifier v0.3.0");
+        _assertCurrentContextDelegatesToProtocolConfig();
     }
 
-    /**
-     * @dev Tests that getKmsSigners view function works as expected.
-     */
-    function test_GetKmsSignersWorkAsExpected() public {
-        uint256 numberSigners = 3;
-        _upgradeProxyWithSigners(numberSigners);
-        address[] memory signers = kmsVerifier.getKmsSigners();
-        assertEq(signers.length, numberSigners);
-        assertEq(signers[0], signer0);
-        assertEq(signers[1], signer1);
-        assertEq(signers[2], signer2);
-        for (uint256 i = 0; i < numberSigners; i++) {
-            assertTrue(kmsVerifier.isSigner(signers[i]));
-        }
+    function test_DelegationGetKmsSigners() public {
+        uint256 currentCtx = protocolConfig.getCurrentKmsContextId();
+        assertEq(kmsVerifier.getKmsSigners(), protocolConfig.getKmsSignersForContext(currentCtx));
     }
 
-    /**
-     * @dev Tests that only the contract owner can add a signer.
-     */
-    function test_OnlyOwnerCanDefineNewContext(address randomAccount) public {
-        vm.assume(randomAccount != owner);
-        _upgradeProxyWithSigners(3);
-        address randomSigner = address(42);
-        vm.expectPartialRevert(ACLOwnable.NotHostOwner.selector);
-        vm.prank(randomAccount);
-        address[] memory newSigners = new address[](1);
-        newSigners[0] = randomSigner;
-        kmsVerifier.defineNewContext(newSigners, 1);
+    function test_DelegationIsSigner() public {
+        assertEq(kmsVerifier.isSigner(signer0), protocolConfig.isKmsSigner(signer0));
+        assertEq(kmsVerifier.isSigner(address(0xdead)), protocolConfig.isKmsSigner(address(0xdead)));
     }
 
-    /**
-     * @dev Tests that the contract owner cannot add a null address as a signer.
-     */
-    function test_OwnerCannotAddNullAddressAsSigner() public {
-        _upgradeProxyWithSigners(3);
-        address nullSigner = address(0);
-        address[] memory newSigners = new address[](1);
-        newSigners[0] = nullSigner;
-        vm.expectPartialRevert(KMSVerifier.KMSSignerNull.selector);
+    function test_DelegationGetCurrentKmsContextId() public {
+        assertEq(kmsVerifier.getCurrentKmsContextId(), protocolConfig.getCurrentKmsContextId());
+    }
+
+    function test_ProtocolConfigStateChangeReflectedInVerifier() public {
+        uint256 currentCtx = protocolConfig.getCurrentKmsContextId();
+        assertEq(kmsVerifier.getCurrentKmsContextId(), currentCtx);
+
+        address[] memory nextSigners = _makeSingleSignerList(signer3);
         vm.prank(owner);
-        kmsVerifier.defineNewContext(newSigners, 1);
+        protocolConfig.defineNewKmsContext(_makeKmsNodesFromSigners(nextSigners), _defaultThresholds());
+
+        uint256 nextCtx = protocolConfig.getCurrentKmsContextId();
+        assertEq(kmsVerifier.getCurrentKmsContextId(), nextCtx);
+        assertEq(kmsVerifier.getKmsSigners(), protocolConfig.getKmsSignersForContext(nextCtx));
+        assertTrue(kmsVerifier.isSigner(signer3));
+        assertFalse(kmsVerifier.isSigner(signer0));
     }
 
-    /**
-     * @dev Tests that the owner of the contract can successfully add a new signer.
-     */
-    function test_OwnerCanAddNewSigner() public {
-        _upgradeProxyWithSigners(3);
-        address randomSigner = address(42);
-        address[] memory newSigners = new address[](1);
-        newSigners[0] = randomSigner;
+    function test_GetSignersForKmsContextRevertsForInvalid() public {
+        (uint256 ctx1, ) = _setupHistoricalAndCurrentContexts();
+
         vm.prank(owner);
-        vm.expectEmit();
-        emit KMSVerifier.NewContextSet(newSigners, 1);
-        kmsVerifier.defineNewContext(newSigners, 1);
-        assertEq(kmsVerifier.getKmsSigners()[0], randomSigner);
-        assertTrue(kmsVerifier.isSigner(randomSigner));
+        protocolConfig.destroyKmsContext(ctx1);
+
+        vm.expectRevert(abi.encodeWithSelector(IProtocolConfig.InvalidKmsContext.selector, ctx1));
+        kmsVerifier.getSignersForKmsContext(ctx1);
+
+        uint256 nonExistent = KMS_CONTEXT_COUNTER_BASE + 999;
+        vm.expectRevert(abi.encodeWithSelector(IProtocolConfig.InvalidKmsContext.selector, nonExistent));
+        kmsVerifier.getSignersForKmsContext(nonExistent);
     }
 
-    /**
-     * @dev Tests that the contract owner cannot add the same signer twice.
-     */
-    function test_OwnerCannotAddSameSignerTwice() public {
-        test_OwnerCanAddNewSigner();
-        address randomSigner = kmsVerifier.getKmsSigners()[0];
-        address[] memory newSigners = new address[](2);
-        newSigners[0] = randomSigner;
-        newSigners[1] = randomSigner;
-        vm.prank(owner);
-        vm.expectRevert(KMSVerifier.KMSAlreadySigner.selector);
-        kmsVerifier.defineNewContext(newSigners, 1);
-    }
-
-    /**
-     * @dev Tests that the owner can successfully remove a signer.
-     */
-    function test_OwnerCanRemoveSigner() public {
-        /// @dev We call the other test to avoid repeating the same code.
-        test_OwnerCanAddNewSigner();
-
-        address randomSigner = address(43);
-        vm.startPrank(owner);
-
-        address[] memory newSigners = new address[](2);
-        newSigners[0] = address(42);
-        newSigners[1] = randomSigner;
-        kmsVerifier.defineNewContext(newSigners, 2);
-        assertEq(kmsVerifier.getKmsSigners().length, 2);
-
-        address[] memory newSigners2 = new address[](1);
-        newSigners2[0] = address(42);
-        kmsVerifier.defineNewContext(newSigners2, 1);
-        assertFalse(kmsVerifier.isSigner(randomSigner));
-        assertEq(kmsVerifier.getKmsSigners().length, 1);
-    }
-
-    /**
-     * @dev Test to ensure that the contract owner cannot remove the last signer.
-     * This function verifies that the contract logic prevents the removal of the
-     * final signer, maintaining at least one signer at all times.
-     */
-    function test_OwnerCannotRemoveTheLastSigner() public {
-        /// @dev We call the other test to avoid repeating the same code.
-        test_OwnerCanAddNewSigner();
-        address[] memory emptyAddress = new address[](0);
-        vm.prank(owner);
-        vm.expectRevert(KMSVerifier.SignersSetIsEmpty.selector);
-        kmsVerifier.defineNewContext(emptyAddress, 0);
-    }
-
-    /**
-     * @dev Tests that only the owner can set the threshold.
-     * @param randomAccount An address that is not the owner.
-     */
-    function test_OnlyOwnerCanSetThreshold(address randomAccount) public {
-        vm.assume(randomAccount != owner);
-        _upgradeProxyWithSigners(3);
-        vm.prank(randomAccount);
-        vm.expectPartialRevert(ACLOwnable.NotHostOwner.selector);
-        kmsVerifier.setThreshold(2);
-    }
-
-    /**
-     * @dev Tests that the threshold value must not be set to 0.
-     */
-    function test_ThresholdMustBeNotSetToZero() public {
-        _upgradeProxyWithSigners(3);
-        vm.prank(owner);
-        vm.expectRevert(KMSVerifier.ThresholdIsNull.selector);
-        kmsVerifier.setThreshold(0);
-    }
-
-    /**
-     * @dev Tests that the threshold cannot be set if it is above the number of signers.
-     */
-    function test_ThresholdCannotBeSetIfAboveNumberOfSigners() public {
-        _upgradeProxyWithSigners(3);
-        vm.prank(owner);
-        vm.expectRevert(KMSVerifier.ThresholdIsAboveNumberOfSigners.selector);
-        kmsVerifier.setThreshold(4);
-    }
-
-    /// @dev This function exists for the test below to call it externally.
-    function upgrade(address randomAccount) external {
-        UnsafeUpgrades.upgradeProxy(proxy, address(new EmptyUUPSProxy()), "", randomAccount);
-    }
-
-    /**
-     * @dev Tests that only the owner can authorize an upgrade.
-     */
-    function test_OnlyOwnerCanAuthorizeUpgrade(address randomAccount) public {
-        _upgradeProxyWithSigners(3);
-        vm.assume(randomAccount != owner);
-        /// @dev Have to use external call to this to avoid this issue:
-        ///      https://github.com/foundry-rs/foundry/issues/5806
-        vm.expectPartialRevert(ACLOwnable.NotHostOwner.selector);
-        this.upgrade(randomAccount);
-    }
-
-    /**
-     * @dev Tests that the contract owner can authorize an upgrade.
-     */
-    function test_OnlyOwnerCanAuthorizeUpgrade() public {
-        _upgradeProxyWithSigners(3);
-        /// @dev It does not revert since it called by the owner.
-        this.upgrade(owner);
-    }
-
-    /**
-     * @dev Tests that the EIP-712 KMS signatures verification works correctly
-     *      by setting up three signers, creating a list of handles, generating a
-     *      decrypted result, computing the digest, and verifying the signatures.
-     */
     function test_VerifyDecryptionEIP712KMSSignaturesWork() public {
-        _upgradeProxyWithSigners(3);
         bytes32[] memory handlesList = _generateMockHandlesList(3);
 
-        bytes memory decryptedResult = abi.encodePacked(keccak256("test"), keccak256("test"), keccak256("test"));
+        bytes memory decryptedResult = _mockDecryptedResult();
         bytes memory extraData = abi.encodePacked(uint8(0));
         bytes32 digest = _computeDigest(handlesList, decryptedResult, extraData);
 
@@ -417,19 +212,37 @@ contract KMSVerifierTest is Test {
         assertTrue(kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof));
     }
 
-    /**
-     * @dev Tests that verifyDecryptionEIP712KMSSignatures fails as expected if the digest is invalid.
-     */
+    function test_VerificationSucceedsWithLastPositionSigner() public {
+        bytes memory extraData = abi.encodePacked(uint8(0));
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner2,
+            extraData
+        );
+        assertTrue(kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof));
+    }
+
+    function test_GetSignersForKmsContextReturnsCorrectHistoricalSigners() public {
+        uint256 historicalCtx = kmsVerifier.getCurrentKmsContextId();
+
+        address[] memory nextSigners = _makeSingleSignerList(signer3);
+        vm.prank(owner);
+        protocolConfig.defineNewKmsContext(_makeKmsNodesFromSigners(nextSigners), _defaultThresholds());
+
+        address[] memory historicalSigners = kmsVerifier.getSignersForKmsContext(historicalCtx);
+        assertEq(historicalSigners.length, 3);
+        assertEq(historicalSigners[0], signer0);
+        assertEq(historicalSigners[1], signer1);
+        assertEq(historicalSigners[2], signer2);
+    }
+
     function test_VerifyDecryptionEIP712KMSSignaturesFailAsExpectedIfDigestIsInvalid() public {
-        _upgradeProxyWithSigners(3);
         bytes32[] memory handlesList = _generateMockHandlesList(3);
 
-        bytes memory decryptedResult = abi.encodePacked(keccak256("test"), keccak256("test"), keccak256("test"));
+        bytes memory decryptedResult = _mockDecryptedResult();
         bytes memory extraData = abi.encodePacked(uint8(0));
         bytes[] memory signatures = new bytes[](2);
 
         bytes32 invalidDigest = bytes32("420");
-
         signatures[0] = _computeSignature(privateKeySigner1, invalidDigest);
         signatures[1] = _computeSignature(privateKeySigner2, invalidDigest);
 
@@ -444,17 +257,14 @@ contract KMSVerifierTest is Test {
         kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof);
     }
 
-    /**
-     * @dev Tests that the verification of EIP-712 KMS signatures fails as expected when no signer is added.
-     */
     function test_VerifyDecryptionEIP712KMSSignaturesFailAsExpectedIfNoSignerAdded() public {
-        _upgradeProxyWithSigners(1);
-        bytes32[] memory handlesList = new bytes32[](3);
-        handlesList[0] = bytes32(uint256(4));
-        handlesList[1] = bytes32(uint256(5));
-        handlesList[2] = bytes32(uint256(323));
+        // Rotate to a single-signer context (only signer0)
+        vm.prank(owner);
+        protocolConfig.defineNewKmsContext(_makeKmsNodes(1), _defaultThresholds());
 
-        bytes memory decryptedResult = abi.encodePacked(keccak256("test"), keccak256("test"), keccak256("test"));
+        bytes32[] memory handlesList = _generateMockHandlesList(3);
+
+        bytes memory decryptedResult = _mockDecryptedResult();
         bytes memory extraData = abi.encodePacked(uint8(0));
         bytes32 digest = _computeDigest(handlesList, decryptedResult, extraData);
 
@@ -473,38 +283,20 @@ contract KMSVerifierTest is Test {
         kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof);
     }
 
-    /**
-     * @dev Tests that the verification of EIP-712 KMS signatures fails as expected when no signature is provided.
-     */
     function test_VerifyDecryptionEIP712KMSSignaturesFailAsExpectedIfNoSignatureProvided() public {
-        _upgradeProxyWithSigners(3);
-
         bytes32[] memory handlesList = _generateMockHandlesList(3);
-
-        bytes memory decryptedResult = abi.encodePacked(keccak256("test"), keccak256("test"), keccak256("test"));
-        bytes memory extraData = abi.encodePacked(uint8(0));
-        bytes[] memory signatures = new bytes[](0);
-
-        bytes memory decryptionProof = abi.encodePacked(uint8(signatures.length), extraData);
+        bytes memory decryptedResult = _mockDecryptedResult();
+        bytes memory decryptionProof = abi.encodePacked(uint8(0), bytes1(0x00));
 
         vm.expectPartialRevert(KMSVerifier.KMSZeroSignature.selector);
         kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof);
     }
 
-    /**
-     * @dev Tests that the verification of EIP-712 KMS signatures fails as expected
-     *      if the number of signatures is less than the defined threshold.
-     */
     function test_VerifyDecryptionEIP712KMSSignaturesFailAsExpectedIfNumberOfSignaturesIsInferiorToThreshold() public {
-        _upgradeProxyWithSigners(3);
+        _rotateToThresholdTwoContext();
 
-        vm.prank(owner);
-        kmsVerifier.setThreshold(2);
-        assertEq(kmsVerifier.getThreshold(), 2);
-
-        /// @dev Mock data for testing purposes.
         bytes32[] memory handlesList = _generateMockHandlesList(3);
-        bytes memory decryptedResult = abi.encodePacked(keccak256("test"), keccak256("test"), keccak256("test"));
+        bytes memory decryptedResult = _mockDecryptedResult();
         bytes memory extraData = abi.encodePacked(uint8(0));
         bytes32 digest = _computeDigest(handlesList, decryptedResult, extraData);
 
@@ -513,24 +305,15 @@ contract KMSVerifierTest is Test {
 
         bytes memory decryptionProof = abi.encodePacked(uint8(signatures.length), signatures[0], extraData);
 
-        vm.expectPartialRevert(KMSVerifier.KMSSignatureThresholdNotReached.selector);
+        vm.expectRevert(abi.encodeWithSelector(KMSVerifier.KMSSignatureThresholdNotReached.selector, 1));
         kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof);
     }
 
-    /**
-     * @dev Tests that the verification of EIP-712 KMS signatures fails as expected if the same signer is used twice.
-     */
     function test_VerifyDecryptionEIP712KMSSignaturesFailAsExpectedIfSameSignerIsUsedTwice() public {
-        _upgradeProxyWithSigners(3);
+        _rotateToThresholdTwoContext();
 
-        /// @dev The threshold is set to 2, so we need at least 2 signatures from different signers.
-        vm.prank(owner);
-        kmsVerifier.setThreshold(2);
-        assertEq(kmsVerifier.getThreshold(), 2);
-
-        /// @dev Mock data for testing purposes.
         bytes32[] memory handlesList = _generateMockHandlesList(3);
-        bytes memory decryptedResult = abi.encodePacked(keccak256("test"), keccak256("test"), keccak256("test"));
+        bytes memory decryptedResult = _mockDecryptedResult();
         bytes memory extraData = abi.encodePacked(uint8(0));
         bytes32 digest = _computeDigest(handlesList, decryptedResult, extraData);
 
@@ -548,55 +331,218 @@ contract KMSVerifierTest is Test {
         assertFalse(kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof));
     }
 
-    /**
-     * @dev Tests that the verifyDecryptionEIP712KMSSignatures function fails if the decryptionProof is empty.
-     */
     function test_VerifyDecryptionEIP712KMSSignaturesFailsIfEmptyDecryptionProof() public {
-        _upgradeProxyWithSigners(3);
         bytes32[] memory handlesList = _generateMockHandlesList(3);
-
-        bytes memory decryptedResult = abi.encodePacked(keccak256("test"), keccak256("test"), keccak256("test"));
-        bytes memory decryptionProof = new bytes(0);
+        bytes memory decryptedResult = _mockDecryptedResult();
 
         vm.expectRevert(KMSVerifier.EmptyDecryptionProof.selector);
-        kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof);
+        kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, new bytes(0));
     }
 
-    /**
-     * @dev Tests that the verifyDecryptionEIP712KMSSignatures function fails if the length of the decryption proof is invalid.
-     */
-    function test_VerifyDecryptionEIP712KMSSignaturesFailsIfDeserializingDecryptionProofFail(uint256 randomValue) public {
-        _upgradeProxyWithSigners(3);
+    function testFuzz_VerifyDecryptionEIP712KMSSignaturesFailsIfDeserializingDecryptionProofFail(
+        uint8 numSigners,
+        uint16 rawProofLength
+    ) public {
+        numSigners = uint8(bound(uint256(numSigners), 1, type(uint8).max));
+        uint256 proofLength = bound(uint256(rawProofLength), 1, 65 * uint256(numSigners));
         bytes32[] memory handlesList = _generateMockHandlesList(3);
-
-        bytes memory decryptedResult = abi.encodePacked(keccak256("test"), keccak256("test"), keccak256("test"));
-        bytes memory decryptionProof = abi.encodePacked(uint8(3), randomValue);
+        bytes memory decryptedResult = _mockDecryptedResult();
+        bytes memory decryptionProof = new bytes(proofLength);
+        decryptionProof[0] = bytes1(numSigners);
 
         vm.expectRevert(KMSVerifier.DeserializingDecryptionProofFail.selector);
         kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof);
     }
 
-    /// @dev This function exists for the test below to call it externally.
-    function emptyUpgrade() public {
-        address[] memory emptySigners = new address[](0);
-        implementation = address(new KMSVerifier());
+    function test_VerificationSucceedsForOldContextWithOldSigners() public {
+        (uint256 ctx1, ) = _setupHistoricalAndCurrentContexts();
 
-        UnsafeUpgrades.upgradeProxy(
-            proxy,
-            implementation,
-            abi.encodeCall(
-                KMSVerifier.initializeFromEmptyProxy,
-                (verifyingContractSource, uint64(block.chainid), emptySigners, initialThreshold)
-            ),
-            owner
+        bytes memory extraData = abi.encodePacked(uint8(0x01), ctx1);
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            extraData
         );
+
+        assertTrue(kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof));
     }
 
-    /**
-     * @dev Tests that the contract cannot be reinitialized if the initial signers set is empty.
-     */
-    function test_CannotReinitializeIfInitialSignersSetIsEmpty() public {
-        vm.expectPartialRevert(KMSVerifier.SignersSetIsEmpty.selector);
-        this.emptyUpgrade();
+    function test_VerificationUsesPerContextThresholdForHistoricalContext() public {
+        // Rotate to a new context with 3 signers and threshold=2
+        IProtocolConfig.KmsThresholds memory t2 = _defaultThresholds();
+        t2.publicDecryption = 2;
+        vm.prank(owner);
+        protocolConfig.defineNewKmsContext(_makeKmsNodes(3), t2);
+        uint256 historicalCtx = protocolConfig.getCurrentKmsContextId();
+        assertEq(protocolConfig.getPublicDecryptionThreshold(), 2);
+
+        // Rotate again to a single-signer context with threshold=1 (now current)
+        vm.prank(owner);
+        protocolConfig.defineNewKmsContext(
+            _makeKmsNodesFromSigners(_makeSingleSignerList(signer3)),
+            _defaultThresholds()
+        );
+        assertEq(protocolConfig.getPublicDecryptionThreshold(), 1);
+
+        // Verify against historical context with only 1 signature — must fail (threshold=2)
+        bytes memory extraData = abi.encodePacked(uint8(0x01), historicalCtx);
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            extraData
+        );
+        vm.expectRevert(abi.encodeWithSelector(KMSVerifier.KMSSignatureThresholdNotReached.selector, 1));
+        kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof);
+
+        // Verify against historical context with 2 valid signatures — must succeed
+        handlesList = _generateMockHandlesList(3);
+        decryptedResult = _mockDecryptedResult();
+        bytes32 digest = _computeDigest(handlesList, decryptedResult, extraData);
+        bytes[] memory signatures = new bytes[](2);
+        signatures[0] = _computeSignature(privateKeySigner0, digest);
+        signatures[1] = _computeSignature(privateKeySigner1, digest);
+        bytes memory decryptionProof = abi.encodePacked(uint8(2), signatures[0], signatures[1], extraData);
+        assertTrue(kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, decryptionProof));
+    }
+
+    function test_VerificationFailsForDestroyedContext() public {
+        (uint256 ctx1, ) = _setupHistoricalAndCurrentContexts();
+
+        vm.prank(owner);
+        protocolConfig.destroyKmsContext(ctx1);
+
+        bytes memory extraData = abi.encodePacked(uint8(0x01), ctx1);
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            extraData
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(IProtocolConfig.InvalidKmsContext.selector, ctx1));
+        kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof);
+    }
+
+    function testFuzz_VerificationFailsWithUnsupportedExtraDataVersion(bytes calldata extraData) public {
+        vm.assume(extraData.length != 0);
+        vm.assume(uint8(extraData[0]) != 0x00);
+        vm.assume(uint8(extraData[0]) != 0x01);
+        uint8 version = uint8(extraData[0]);
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            extraData
+        );
+
+        vm.expectRevert(abi.encodeWithSelector(KMSVerifier.UnsupportedExtraDataVersion.selector, version));
+        kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof);
+    }
+
+    function testFuzz_VerificationFailsWithMalformedV1ExtraData(bytes calldata malformedSuffix) public {
+        vm.assume(malformedSuffix.length < 32);
+        bytes memory extraData = abi.encodePacked(uint8(0x01), malformedSuffix);
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            extraData
+        );
+
+        vm.expectRevert(KMSVerifier.DeserializingExtraDataFail.selector);
+        kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof);
+    }
+
+    function testFuzz_VerificationFailsForInvalidContextWithV1ExtraData(uint256 invalidCtx) public {
+        vm.assume(invalidCtx != kmsVerifier.getCurrentKmsContextId());
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            abi.encodePacked(uint8(0x01), invalidCtx)
+        );
+        vm.expectRevert(abi.encodeWithSelector(IProtocolConfig.InvalidKmsContext.selector, invalidCtx));
+        kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof);
+    }
+
+    function test_VerificationSucceedsWithEmptyExtraData() public {
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            new bytes(0)
+        );
+
+        assertTrue(kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof));
+    }
+
+    function test_CrossContextSignerRejection() public {
+        (uint256 ctx1, ) = _setupHistoricalAndCurrentContexts();
+
+        bytes memory extraData = abi.encodePacked(uint8(0x01), ctx1);
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner3,
+            extraData
+        );
+
+        vm.expectPartialRevert(KMSVerifier.KMSInvalidSigner.selector);
+        kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof);
+    }
+
+    function test_VerificationSucceedsWithV1ExtraDataForCurrentContext() public {
+        uint256 currentCtx = kmsVerifier.getCurrentKmsContextId();
+
+        bytes memory extraData = abi.encodePacked(uint8(0x01), currentCtx, uint256(12345));
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            extraData
+        );
+
+        assertTrue(kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof));
+    }
+
+    function test_V0ExtraDataWithTrailingBytesUsesCurrentContext() public {
+        bytes memory extraData = abi.encodePacked(uint8(0x00), uint256(12345));
+        (bytes32[] memory handlesList, bytes memory decryptedResult, bytes memory proof) = _buildSingleSignerProof(
+            privateKeySigner0,
+            extraData
+        );
+
+        assertTrue(kmsVerifier.verifyDecryptionEIP712KMSSignatures(handlesList, decryptedResult, proof));
+    }
+
+    function upgrade(address account) external {
+        UnsafeUpgrades.upgradeProxy(proxy, address(new EmptyUUPSProxy()), "", account);
+    }
+
+    function test_OnlyOwnerCanAuthorizeUpgrade(address randomAccount) public {
+        vm.assume(randomAccount != owner);
+        vm.expectPartialRevert(ACLOwnable.NotHostOwner.selector);
+        this.upgrade(randomAccount);
+    }
+
+    function test_OnlyOwnerCanAuthorizeUpgrade() public {
+        this.upgrade(owner);
+    }
+
+    function test_ReinitializeV3CannotBeCalledTwice() public {
+        vm.prank(owner);
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        kmsVerifier.reinitializeV3();
+    }
+
+    function test_GetContextSignersAndThresholdFromExtraData() public {
+        uint256 ctx1 = kmsVerifier.getCurrentKmsContextId();
+
+        (address[] memory v0Signers, uint256 v0Threshold) = kmsVerifier.getContextSignersAndThresholdFromExtraData(
+            hex"00"
+        );
+        assertEq(v0Signers.length, 3);
+        assertEq(v0Signers[0], signer0);
+        assertEq(v0Threshold, 1);
+
+        address[] memory nextSigners = _makeSingleSignerList(signer3);
+        vm.prank(owner);
+        protocolConfig.defineNewKmsContext(_makeKmsNodesFromSigners(nextSigners), _defaultThresholds());
+
+        bytes memory v1ExtraData = abi.encodePacked(uint8(0x01), ctx1);
+        (address[] memory oldCtxSigners, uint256 oldCtxThreshold) = kmsVerifier
+            .getContextSignersAndThresholdFromExtraData(v1ExtraData);
+        assertEq(oldCtxSigners.length, 3);
+        assertEq(oldCtxSigners[0], signer0);
+        assertEq(oldCtxThreshold, 1);
+
+        vm.prank(owner);
+        protocolConfig.destroyKmsContext(ctx1);
+        vm.expectRevert(abi.encodeWithSelector(IProtocolConfig.InvalidKmsContext.selector, ctx1));
+        kmsVerifier.getContextSignersAndThresholdFromExtraData(v1ExtraData);
     }
 }

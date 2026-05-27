@@ -3,12 +3,11 @@ use std::time::Duration;
 use alloy::primitives::Address;
 use anyhow::Context;
 use clap::Parser;
-use sqlx::types::Uuid;
 use tokio_util::sync::CancellationToken;
 use tracing::Level;
 
-use fhevm_engine_common::metrics_server;
 use fhevm_engine_common::utils::DatabaseURL;
+use fhevm_engine_common::{metrics_server, telemetry};
 use host_listener::cmd::{
     DEFAULT_DEPENDENCE_BY_CONNEXITY, DEFAULT_DEPENDENCE_CACHE_SIZE,
     DEFAULT_DEPENDENCE_CROSS_BLOCK,
@@ -31,11 +30,15 @@ struct Args {
     #[arg(long, help = "TFHE contract address to monitor")]
     tfhe_contract_address: Address,
 
+    #[arg(
+        long,
+        default_value = "",
+        help = "Optional KMS generation contract address to monitor"
+    )]
+    pub kms_generation_address: String,
+
     #[arg(long, help = "PostgreSQL connection URL")]
     database_url: DatabaseURL,
-
-    #[arg(long, help = "Coprocessor API key")]
-    coprocessor_api_key: Option<Uuid>,
 
     #[arg(
         long,
@@ -118,17 +121,39 @@ struct Args {
         help = "Dependence chain are across blocks"
     )]
     pub dependence_cross_block: bool,
+
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Max dependent ops per chain before slow-lane (0 disables; startup promotes all chains to fast)"
+    )]
+    pub dependent_ops_max_per_chain: u32,
+}
+
+fn parse_optional_address(
+    value: &str,
+    name: &str,
+) -> anyhow::Result<Option<Address>> {
+    let value = value.trim();
+    if value.is_empty() {
+        Ok(None)
+    } else {
+        value
+            .parse::<Address>()
+            .with_context(|| format!("Invalid {name} address: {value}"))
+            .map(Some)
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_level(true)
-        .with_max_level(args.log_level)
-        .init();
+    let _otel_guard = telemetry::init_tracing_otel_with_logs_only_fallback(
+        args.log_level,
+        &args.service_name,
+        "otlp-layer",
+    );
 
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
@@ -138,16 +163,15 @@ async fn main() -> anyhow::Result<()> {
         cancel_token.child_token(),
     );
 
-    let coprocessor_api_key = args
-        .coprocessor_api_key
-        .context("A Coprocessor API key is required to access the database")?;
-
     let config = PollerConfig {
         url: args.url,
         acl_address: args.acl_contract_address,
         tfhe_address: args.tfhe_contract_address,
+        kms_generation_address: parse_optional_address(
+            &args.kms_generation_address,
+            "KMS generation contract",
+        )?,
         database_url: args.database_url,
-        coprocessor_api_key,
         finality_lag: args.finality_lag,
         batch_size: args.batch_size,
         poll_interval: Duration::from_millis(args.poll_interval_ms),
@@ -159,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
         dependence_cache_size: args.dependence_cache_size,
         dependence_by_connexity: args.dependence_by_connexity,
         dependence_cross_block: args.dependence_cross_block,
+        dependent_ops_max_per_chain: args.dependent_ops_max_per_chain,
     };
 
     run_poller(config).await

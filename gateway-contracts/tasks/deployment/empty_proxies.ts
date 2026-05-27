@@ -68,10 +68,6 @@ task("task:deployEmptyUUPSProxies").setAction(async function (_, { ethers, upgra
   // set, as they are made owned by the GatewayConfig contract's owner.
   await run("compile:specific", { contract: "contracts/emptyProxy" });
 
-  console.log("Deploying an EmptyUUPS proxy contract for MultichainACL...");
-  const multichainACLAddress = await deployEmptyUUPS(ethers, upgrades, deployer);
-  setGatewayContractAddress("MultichainACL", multichainACLAddress);
-
   console.log("Deploying an EmptyUUPS proxy contract for CiphertextCommits...");
   const ciphertextCommitsAddress = await deployEmptyUUPS(ethers, upgrades, deployer);
   setGatewayContractAddress("CiphertextCommits", ciphertextCommitsAddress);
@@ -79,10 +75,6 @@ task("task:deployEmptyUUPSProxies").setAction(async function (_, { ethers, upgra
   console.log("Deploying an EmptyUUPS proxy contract for Decryption...");
   const decryptionAddress = await deployEmptyUUPS(ethers, upgrades, deployer);
   setGatewayContractAddress("Decryption", decryptionAddress);
-
-  console.log("Deploying an EmptyUUPS proxy contract for KMSGeneration...");
-  const kmsGenerationAddress = await deployEmptyUUPS(ethers, upgrades, deployer);
-  setGatewayContractAddress("KMSGeneration", kmsGenerationAddress);
 
   console.log("Deploying an EmptyUUPS proxy contract for InputVerification...");
   const inputVerificationAddress = await deployEmptyUUPS(ethers, upgrades, deployer);

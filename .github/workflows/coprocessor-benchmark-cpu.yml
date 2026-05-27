@@ -132,7 +132,7 @@ jobs:
                                                                  libclang-dev docker-compose-v2 \
                                                                  docker.io acl
           sudo systemctl start docker
-          cargo install sqlx-cli
+          cargo +stable install sqlx-cli --version 0.7.2 --no-default-features --features postgres --locked
 
       - name: Install foundry
         uses: foundry-rs/foundry-toolchain@de808b1eea699e761c404bda44ba8f21aba30b2c
@@ -148,11 +148,14 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-
 
       - name: Login to GitHub Container Registry
-        uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
+        uses: zama-ai/ci-templates/.github/actions/retry@542103e14b9ae6a9aea27787b8724b3b35bb3918 # v1.0.9
+        env:
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          command: |
+            echo "Logging into ghcr.io..."
+            echo "$GHCR_PASSWORD" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin
 
       - name: Login to Chainguard Registry
         uses: docker/login-action@9780b0c442fbb1117ed29e0efdff1e18412f7567 # v3.3.0
@@ -172,7 +175,7 @@ jobs:
 
       - name: Start localstack
         run: |
-          docker run --rm -d -p 4566:4566 --name localstack localstack/localstack:latest
+          docker run --rm -d -p 4566:4566 --name localstack localstack/localstack:4.14.0
 
       - name: Run benchmarks on CPU
         run: |

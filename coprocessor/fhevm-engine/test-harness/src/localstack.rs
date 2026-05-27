@@ -7,7 +7,7 @@ use base64::Engine;
 use k256::SecretKey;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 
-fn pick_free_port() -> u16 {
+pub fn pick_free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -24,7 +24,7 @@ pub struct LocalstackContainer {
 
 pub async fn start_localstack() -> anyhow::Result<LocalstackContainer> {
     let host_port = pick_free_port();
-    let container = GenericImage::new("localstack/localstack", "stable")
+    let container = GenericImage::new("localstack/localstack", "4.14.0")
         .with_exposed_port(LOCALSTACK_PORT.into())
         .with_wait_for(WaitFor::message_on_stdout("Ready."))
         .with_mapped_port(host_port, LOCALSTACK_PORT.into())

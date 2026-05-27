@@ -6,6 +6,7 @@ use crate::{
 };
 use anyhow::{anyhow, Ok};
 use aws_config::BehaviorVersion;
+use fhevm_engine_common::db_keys::DbKeyId;
 use fhevm_engine_common::utils::{to_hex, DatabaseURL};
 use serde::{Deserialize, Serialize};
 use serial_test::serial;
@@ -29,7 +30,6 @@ use tokio::{sync::mpsc, time::timeout};
 use tracing::{info, Level};
 
 const LISTEN_CHANNEL: &str = "sns_worker_chan";
-const TENANT_API_KEY: &str = "a1503fb6-d79b-4e9e-826d-44cf262f3e05";
 
 static TRACING_INIT: OnceLock<()> = OnceLock::new();
 
@@ -133,23 +133,14 @@ async fn test_decryptable(
     if first_fhe_computation {
         // insert into ciphertexts
         insert_ciphertext64(pool, handle, ciphertext).await?;
-        insert_into_pbs_computations(pool, handle).await?;
+        insert_into_pbs_computations(pool, test_env.host_chain_id, handle).await?;
     } else {
         // insert into pbs_computations
-        insert_into_pbs_computations(pool, handle).await?;
+        insert_into_pbs_computations(pool, test_env.host_chain_id, handle).await?;
         insert_ciphertext64(pool, handle, ciphertext).await?;
     }
 
-    let tenant_id = get_tenant_id_from_db(pool, TENANT_API_KEY).await;
-
-    assert_ciphertext128(
-        test_env,
-        tenant_id,
-        with_compression,
-        handle,
-        expected_result,
-    )
-    .await?;
+    assert_ciphertext128(test_env, with_compression, handle, expected_result).await?;
 
     Ok(())
 }
@@ -174,7 +165,7 @@ async fn run_batch_computations(
     info!(batch_size, "Inserting ciphertexts ...");
 
     let mut handles = Vec::new();
-    let tenant_id = get_tenant_id_from_db(pool, TENANT_API_KEY).await;
+    let host_chain_id = test_env.host_chain_id;
     for i in 0..batch_size {
         let mut handle = base_handle.to_owned();
 
@@ -182,8 +173,8 @@ async fn run_batch_computations(
         // However the ciphertext64 will be the same
         handle[0] = (i >> 8) as u8;
         handle[1] = (i & 0xFF) as u8;
-        test_harness::db_utils::insert_ciphertext64(pool, tenant_id, &handle, ciphertext).await?;
-        test_harness::db_utils::insert_into_pbs_computations(pool, tenant_id, &handle).await?;
+        test_harness::db_utils::insert_ciphertext64(pool, &handle, ciphertext).await?;
+        test_harness::db_utils::insert_into_pbs_computations(pool, host_chain_id, &handle).await?;
         handles.push(handle);
     }
 
@@ -204,14 +195,7 @@ async fn run_batch_computations(
         let test_env = test_env.clone();
         let handle = handle.clone();
         set.spawn(async move {
-            assert_ciphertext128(
-                &test_env,
-                tenant_id,
-                with_compression,
-                &handle,
-                expected_cleartext,
-            )
-            .await
+            assert_ciphertext128(&test_env, with_compression, &handle, expected_cleartext).await
         });
     }
 
@@ -247,25 +231,31 @@ async fn test_lifo_mode() {
 
     const HANDLES_COUNT: usize = 30;
     const BATCH_SIZE: usize = 4;
+    let key_id_gw: DbKeyId = vec![0u8; 32];
 
+    let host_chain_id: i64 = 1;
     for i in 0..HANDLES_COUNT {
         // insert into ciphertexts
         test_harness::db_utils::insert_ciphertext64(
             &pool,
-            1,
             &Vec::from([i as u8; 32]),
             &Vec::from([i as u8; 32]),
         )
         .await
         .unwrap();
 
-        test_harness::db_utils::insert_into_pbs_computations(&pool, 1, &Vec::from([i as u8; 32]))
-            .await
-            .unwrap();
+        test_harness::db_utils::insert_into_pbs_computations(
+            &pool,
+            host_chain_id,
+            &Vec::from([i as u8; 32]),
+        )
+        .await
+        .unwrap();
     }
 
     let mut trx = pool.begin().await.unwrap();
-    if let Result::Ok(Some(tasks)) = query_sns_tasks(&mut trx, BATCH_SIZE as u32, Order::Desc).await
+    if let Result::Ok(Some(tasks)) =
+        query_sns_tasks(&mut trx, BATCH_SIZE as u32, Order::Desc, &key_id_gw).await
     {
         assert!(
             tasks.len() == BATCH_SIZE,
@@ -288,7 +278,8 @@ async fn test_lifo_mode() {
     }
 
     let mut trx = pool.begin().await.unwrap();
-    if let Result::Ok(Some(tasks)) = query_sns_tasks(&mut trx, BATCH_SIZE as u32, Order::Asc).await
+    if let Result::Ok(Some(tasks)) =
+        query_sns_tasks(&mut trx, BATCH_SIZE as u32, Order::Asc, &key_id_gw).await
     {
         assert!(
             tasks.len() == BATCH_SIZE,
@@ -331,17 +322,17 @@ async fn test_garbage_collect() {
 
     clean_up(&pool).await.unwrap();
 
-    let tenant_id = 1;
+    let host_chain_id: i64 = 1;
+    let key_id_gw: Vec<u8> = vec![0u8; 32];
     for i in 0..HANDLES_COUNT {
         // insert into ciphertexts
         let mut handle = [0u8; 32];
         handle[..4].copy_from_slice(&i.to_le_bytes());
 
         let _ = sqlx::query!(
-            "INSERT INTO ciphertexts128(tenant_id, handle, ciphertext)
-                VALUES ($1, $2, $3)
+            "INSERT INTO ciphertexts128(handle, ciphertext)
+                VALUES ($1, $2)
             ON CONFLICT DO NOTHING;",
-            tenant_id,
             &handle,
             &[i as u8; 32],
         )
@@ -350,10 +341,11 @@ async fn test_garbage_collect() {
         .expect("insert into ciphertexts");
 
         let _ = sqlx::query!(
-            "INSERT INTO ciphertext_digest(tenant_id, handle, ciphertext, ciphertext128 )
-                VALUES ($1, $2, $3, $4)
+            "INSERT INTO ciphertext_digest(host_chain_id, key_id_gw, handle, ciphertext, ciphertext128 )
+                VALUES ($1, $2, $3, $4, $5)
             ON CONFLICT DO NOTHING;",
-            tenant_id,
+            host_chain_id,
+            &key_id_gw,
             &handle,
             &[i as u8; 32],
             &[i as u8; 32],
@@ -412,6 +404,8 @@ async fn test_garbage_collect() {
 struct TestEnvironment {
     pub pool: sqlx::PgPool,
     pub client_key: Option<ClientKey>,
+    pub key_id_gw: DbKeyId,
+    pub host_chain_id: i64,
     pub db_instance: DBInstance,
     pub s3_instance: Option<Arc<LocalstackContainer>>, // If None, the global LocalStack is used
     pub s3_client: aws_sdk_s3::Client,
@@ -448,7 +442,9 @@ async fn setup(enable_compression: bool) -> anyhow::Result<TestEnvironment> {
     let token = db_instance.parent_token.child_token();
     let config: Config = conf.clone();
 
-    let client_key: Option<ClientKey> = fetch_client_key(&pool, &TENANT_API_KEY.to_owned()).await?;
+    let key_id_gw = fetch_latest_key_id_gw(&pool).await;
+    let host_chain_id = fetch_host_chain_id(&pool).await;
+    let client_key: Option<ClientKey> = fetch_client_key(&pool, &key_id_gw).await?;
 
     let (events_tx, mut events_rx) = mpsc::channel::<&'static str>(10);
     tokio::spawn(async move {
@@ -468,6 +464,8 @@ async fn setup(enable_compression: bool) -> anyhow::Result<TestEnvironment> {
     Ok(TestEnvironment {
         pool,
         client_key,
+        key_id_gw,
+        host_chain_id,
         db_instance,
         s3_instance,
         s3_client,
@@ -533,25 +531,83 @@ struct TestFile {
     pub cleartext: i64,
 }
 
-/// Creates a test-file from handle, ciphertext64 and plaintext
-/// Can be used to update/create_new ciphertext64.json file
-#[expect(dead_code)]
+/// Regenerates `ciphertext64.json` against the current
+/// `fhevm-keys/xof-keyset` LFS fixture.
+///
+/// The on-disk fixture is bound to a specific `CompactPublicKey`, so
+/// every rotation of `xof-keyset` invalidates it: SNS converts the
+/// stored ciphertext64 under the new server key, but the decrypted
+/// value no longer matches `cleartext` because the input bytes were
+/// encrypted under the old key.
+///
+/// Re-run via:
+///   `cargo test -p sns-worker --features test_decrypt_128 \
+///       -- --ignored regenerate_ciphertext64_fixture`
+/// then commit the updated `ciphertext64.json`.
 fn write_test_file(filename: &str) {
-    let handle: [u8; 32] = hex::decode("TBD").unwrap().try_into().unwrap();
-    let ciphertext64 = hex::decode("TBD").unwrap();
-    let plaintext = 0;
+    use fhevm_engine_common::types::SupportedFheCiphertexts;
+    use fhevm_engine_common::utils::safe_deserialize_key;
+    use tfhe::prelude::CiphertextList;
+    use tfhe::xof_key_set::CompressedXofKeySet;
+
+    let keyset_bytes = std::fs::read("../fhevm-keys/xof-keyset").expect("read xof-keyset fixture");
+    let keyset: CompressedXofKeySet =
+        safe_deserialize_key(&keyset_bytes).expect("deserialize CompressedXofKeySet");
+    // Whole-keyset decompression: same XOF stream the production
+    // readers (sns-worker, tfhe-worker GPU) traverse, so the
+    // CompactPublicKey we encrypt under matches what the DB pks_key
+    // column will carry.
+    let (compact_public_key, server_key) = keyset
+        .decompress()
+        .expect("decompress xof keyset")
+        .into_raw_parts();
+
+    // CompactCiphertextList expansion and CompressedCiphertextList
+    // build both consult the thread-local server key.
+    tfhe::set_server_key(server_key);
+
+    let mut builder = tfhe::CompactCiphertextList::builder(&compact_public_key);
+    builder.push(0_u64);
+    let compact_list = builder.build();
+    let expanded = compact_list
+        .expand()
+        .expect("expand compact ciphertext list");
+    let ct: tfhe::FheUint64 = expanded
+        .get(0)
+        .expect("get(0) from expanded list")
+        .expect("expanded list has element 0");
+
+    let ciphertext64 = SupportedFheCiphertexts::FheUint64(ct)
+        .compress()
+        .expect("compress FheUint64 to CompressedCiphertextList");
+
+    // Handle preserved verbatim: byte 30 = 5 is the FheUint64 type
+    // tag consumed by get_ct_type, and bytes 0-1 are overwritten per
+    // batch entry by test_batch_execution; the rest is arbitrary
+    // padding.
+    let handle: [u8; 32] = [
+        82, 179, 54, 227, 20, 74, 138, 57, 192, 160, 141, 228, 185, 10, 90, 70, 138, 165, 113, 249,
+        28, 54, 93, 45, 102, 136, 242, 216, 124, 6, 5, 3,
+    ];
 
     let v = TestFile {
         handle,
         ciphertext64,
-        cleartext: plaintext,
+        cleartext: 0,
     };
 
-    // Write bytes to a file
     File::create(filename)
         .expect("Failed to create file")
         .write_all(&serde_json::to_vec(&v).unwrap())
         .expect("Failed to write to file");
+}
+
+/// Run only when intentionally regenerating the LFS-bound fixture.
+/// See [`write_test_file`] for the workflow.
+#[test]
+#[ignore = "regenerates ciphertext64.json against the current xof-keyset fixture"]
+fn regenerate_ciphertext64_fixture() {
+    write_test_file("ciphertext64.json");
 }
 
 fn read_test_file(filename: &str) -> TestFile {
@@ -561,15 +617,18 @@ fn read_test_file(filename: &str) -> TestFile {
     serde_json::from_slice(&buffer).expect("Failed to deserialize")
 }
 
-async fn get_tenant_id_from_db(pool: &sqlx::PgPool, tenant_api_key: &str) -> i32 {
-    let tenant_id: i32 =
-        sqlx::query_scalar("SELECT tenant_id FROM tenants WHERE tenant_api_key = $1::uuid")
-            .bind(tenant_api_key)
-            .fetch_one(pool)
-            .await
-            .expect("tenant_id");
+async fn fetch_latest_key_id_gw(pool: &sqlx::PgPool) -> DbKeyId {
+    sqlx::query_scalar("SELECT key_id_gw FROM keys ORDER BY sequence_number DESC LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .expect("key_id_gw")
+}
 
-    tenant_id
+async fn fetch_host_chain_id(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT chain_id FROM host_chains ORDER BY chain_id DESC LIMIT 1")
+        .fetch_one(pool)
+        .await
+        .expect("host_chain_id")
 }
 
 async fn insert_ciphertext64(
@@ -577,8 +636,7 @@ async fn insert_ciphertext64(
     handle: &Vec<u8>,
     ciphertext: &Vec<u8>,
 ) -> anyhow::Result<()> {
-    let tenant_id = get_tenant_id_from_db(pool, TENANT_API_KEY).await;
-    test_harness::db_utils::insert_ciphertext64(pool, tenant_id, handle, ciphertext).await?;
+    test_harness::db_utils::insert_ciphertext64(pool, handle, ciphertext).await?;
 
     // Notify sns_worker
     sqlx::query("SELECT pg_notify($1, '')")
@@ -591,10 +649,10 @@ async fn insert_ciphertext64(
 
 async fn insert_into_pbs_computations(
     pool: &sqlx::PgPool,
+    host_chain_id: i64,
     handle: &Vec<u8>,
 ) -> Result<(), anyhow::Error> {
-    let tenant_id = get_tenant_id_from_db(pool, TENANT_API_KEY).await;
-    test_harness::db_utils::insert_into_pbs_computations(pool, tenant_id, handle).await?;
+    test_harness::db_utils::insert_into_pbs_computations(pool, host_chain_id, handle).await?;
 
     // Notify sns_worker
     sqlx::query("SELECT pg_notify($1, '')")
@@ -624,14 +682,13 @@ async fn clean_up(pool: &sqlx::PgPool) -> anyhow::Result<()> {
 /// It also checks that the ciphertext is uploaded to S3 if the feature is enabled.
 async fn assert_ciphertext128(
     test_env: &TestEnvironment,
-    tenant_id: i32,
     with_compression: bool,
     handle: &Vec<u8>,
     expected_value: i64,
 ) -> anyhow::Result<()> {
     let pool = &test_env.pool;
     let client_key = &test_env.client_key;
-    let ct = test_harness::db_utils::wait_for_ciphertext(pool, tenant_id, handle, 100).await?;
+    let ct = test_harness::db_utils::wait_for_ciphertext(pool, handle, 100).await?;
 
     info!("Ciphertext len: {:?}", ct.len());
 
@@ -753,7 +810,6 @@ fn build_test_config(url: DatabaseURL, enable_compression: bool) -> Config {
         .unwrap_or(SchedulePolicy::RayonParallel);
 
     Config {
-        tenant_api_key: TENANT_API_KEY.to_string(),
         db: DBConfig {
             url,
             listen_channels: vec![LISTEN_CHANNEL.to_string()],

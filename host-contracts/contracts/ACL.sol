@@ -17,6 +17,7 @@ import {ACLEvents} from "./ACLEvents.sol";
  * or decrypt encrypted values in fhEVM. By defining and enforcing these permissions, the ACL ensures that encrypted data remains
  * secure while still being usable within authorized contexts.
  */
+/// @custom:security-contact https://github.com/zama-ai/fhevm/blob/main/SECURITY.md
 contract ACL is
     UUPSUpgradeableEmptyProxy,
     Ownable2StepUpgradeable,
@@ -57,6 +58,12 @@ contract ACL is
     error DelegateCannotBeContractAddress(address contractAddress);
 
     /**
+     * @notice Returned if the delegate address is the wildcard contract address.
+     * @param delegate The address of the delegate.
+     */
+    error DelegateCannotBeWildcard(address delegate);
+
+    /**
      * @notice Returned if the requested expiration date was already set to same expiration for (delegate,contractAddress).
      * @param delegator The address of the account that delegates access to its handles.
      * @param delegate The address of the account that receives the delegation.
@@ -70,11 +77,17 @@ contract ACL is
         uint256 expirationDate
     );
 
-    /// @notice Returned if the requested expiration date for user decryption delegation is before the next hour.
-    error ExpirationDateBeforeOneHour();
+    /// @notice Returned if the requested expiration date for user decryption delegation is in the past.
+    error ExpirationDateInThePast();
 
     /// @notice Returned if the handlesList array is empty.
     error HandlesListIsEmpty();
+
+    /// @notice Returned if the invalidation timestamp is not greater than the current one.
+    error InvalidationTimestampTooLow();
+
+    /// @notice Returned if the invalidation timestamp is in the future.
+    error InvalidationTimestampInTheFuture();
 
     /**
      * @notice Returned if the the delegate contract is not already delegate for sender & delegator addresses.
@@ -134,6 +147,7 @@ contract ACL is
             mapping(address delegate => mapping(address contractAddress => UserDecryptionDelegation delegation)))
                 userDecryptionDelegations;
         mapping(address account => bool isDenied) denyList;
+        mapping(address account => uint256 invalidatedBefore) decryptionSignatureInvalidatedBefore;
     }
 
     /// @notice Name of the contract.
@@ -143,23 +157,31 @@ contract ACL is
     uint256 private constant MAJOR_VERSION = 0;
 
     /// @notice Minor version of the contract.
-    uint256 private constant MINOR_VERSION = 2;
+    uint256 private constant MINOR_VERSION = 5;
 
     /// @notice Patch version of the contract.
     uint256 private constant PATCH_VERSION = 0;
 
     /// @notice FHEVMExecutor address.
-    address private constant fhevmExecutorAddress = fhevmExecutorAdd;
+    address private constant FHEVM_EXECUTOR_ADDRESS = fhevmExecutorAdd;
 
     /// @notice PauserSet contract.
     IPauserSet private constant PAUSER_SET = IPauserSet(pauserSetAdd);
 
+    /**
+     * @notice Sentinel address for user-decryption delegation that applies to every app contract.
+     * @dev `type(uint160).max` (EIP-55: 0xFFfFfFffFFfffFFfFFfFFFFFffFFFffffFfFFFfF). No contract can be deployed here.
+     *      Pass as `contractAddress` in `delegateForUserDecryption` / `revokeDelegationForUserDecryption` to grant or
+     *      revoke blanket delegation. This is a high-trust grant: SDKs should warn users explicitly.
+     */
+    address public constant WILDCARD_DELEGATION_ADDRESS = address(type(uint160).max);
+
     /// Constant used for making sure the version number used in the `reinitializer` modifier is
     /// identical between `initializeFromEmptyProxy` and the `reinitializeVX` method
-    uint64 private constant REINITIALIZER_VERSION = 3;
+    uint64 private constant REINITIALIZER_VERSION = 6;
 
     /// keccak256(abi.encode(uint256(keccak256("fhevm.storage.ACL")) - 1)) & ~bytes32(uint256(0xff))
-    bytes32 private constant ACLStorageLocation = 0xa688f31953c2015baaf8c0a488ee1ee22eb0e05273cc1fd31ea4cbee42febc00;
+    bytes32 private constant ACL_STORAGE_LOCATION = 0xa688f31953c2015baaf8c0a488ee1ee22eb0e05273cc1fd31ea4cbee42febc00;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -176,11 +198,11 @@ contract ACL is
     }
 
     /**
-     * @notice Re-initializes the contract from V1.
+     * @notice Re-initializes the contract from V4.
      */
     /// @custom:oz-upgrades-unsafe-allow missing-initializer-call
     /// @custom:oz-upgrades-validate-as-initializer
-    function reinitializeV2() public virtual reinitializer(REINITIALIZER_VERSION) {}
+    function reinitializeV5() public virtual reinitializer(REINITIALIZER_VERSION) {}
 
     /**
      * @notice Allows the use of `handle` for the address `account`.
@@ -228,6 +250,24 @@ contract ACL is
     }
 
     /**
+     * @notice Invalidates decryption signatures before a given timestamp for the caller.
+     * @param timestamp Oldest timestamp that remains valid. Passing 0 resolves to the current block timestamp.
+     */
+    function invalidateDecryptionSignaturesBefore(uint256 timestamp) external virtual whenNotPaused {
+        uint256 resolvedTimestamp = timestamp == 0 ? block.timestamp : timestamp;
+        ACLStorage storage $ = _getACLStorage();
+        if (resolvedTimestamp <= $.decryptionSignatureInvalidatedBefore[msg.sender]) {
+            revert InvalidationTimestampTooLow();
+        }
+        if (resolvedTimestamp > block.timestamp) {
+            revert InvalidationTimestampInTheFuture();
+        }
+
+        $.decryptionSignatureInvalidatedBefore[msg.sender] = resolvedTimestamp;
+        emit DecryptionSignaturesInvalidated(msg.sender, resolvedTimestamp);
+    }
+
+    /**
      * @notice Allows the use of `handle` by address `account` for this transaction.
      * @dev The caller must not be in the deny list and must be allowed to use `handle` for allowTransient() to succeed.
      *      If not, allowTransient() reverts. The Coprocessor contract can always `allowTransient`,
@@ -236,7 +276,7 @@ contract ACL is
      * @param account Address of the account.
      */
     function allowTransient(bytes32 handle, address account) public virtual whenNotPaused {
-        if (msg.sender != fhevmExecutorAddress) {
+        if (msg.sender != FHEVM_EXECUTOR_ADDRESS) {
             if (isAccountDenied(msg.sender)) {
                 revert SenderDenied(msg.sender);
             }
@@ -260,7 +300,9 @@ contract ACL is
      * @notice Delegates an account the access to handles for user decryption, for instance, in the context of account
      * abstraction for issuing user decryption requests from a smart contract account.
      * @param delegate The address of the account that receives the delegation.
-     * @param contractAddress The contract address to delegate access to.
+     * @param contractAddress The contract address to delegate access to, or `WILDCARD_DELEGATION_ADDRESS` for delegation across
+     *        all contracts (until expiry). Mixing wildcard with per-contract delegations is allowed and can be useful,
+     *        for example when different expiries are desired, although it is often unnecessary.
      * @param expirationDate The UNIX timestamp when the user decryption delegation expires.
      */
     function delegateForUserDecryption(
@@ -268,19 +310,6 @@ contract ACL is
         address contractAddress,
         uint64 expirationDate
     ) public virtual whenNotPaused {
-        /**
-         * @dev Arbitrum block timestamps may be up to one hour ahead of L1.
-         *
-         * Since the expiration is propagated to the Gateway MultichainACL contract deployed on Arbitrum,
-         * we enforce a 1-hour lower bound to stay within Arbitrum’s valid timestamp range
-         * and avoid premature expiration due to clock drift.
-         *
-         * (See https://docs.arbitrum.io/build-decentralized-apps/arbitrum-vs-ethereum/block-numbers-and-time#block-timestamps-arbitrum-vs-ethereum)
-         */
-        if (expirationDate < block.timestamp + 1 hours) {
-            revert ExpirationDateBeforeOneHour();
-        }
-
         ACLStorage storage $ = _getACLStorage();
         UserDecryptionDelegation storage userDecryptionDelegation = $.userDecryptionDelegations[msg.sender][delegate][
             contractAddress
@@ -291,17 +320,20 @@ contract ACL is
             revert AlreadyDelegatedOrRevokedInSameBlock(msg.sender, delegate, contractAddress, blockNumber);
         }
 
-        // Set the last block where the delegation happened.
-        userDecryptionDelegation.lastBlockDelegateOrRevoke = uint64(blockNumber);
-
         if (contractAddress == msg.sender) {
             revert SenderCannotBeContractAddress(contractAddress);
         }
         if (delegate == msg.sender) {
             revert SenderCannotBeDelegate(delegate);
         }
+        if (delegate == WILDCARD_DELEGATION_ADDRESS) {
+            revert DelegateCannotBeWildcard(delegate);
+        }
         if (delegate == contractAddress) {
             revert DelegateCannotBeContractAddress(contractAddress);
+        }
+        if (expirationDate <= block.timestamp) {
+            revert ExpirationDateInThePast();
         }
 
         uint64 oldExpirationDate = userDecryptionDelegation.expirationDate;
@@ -309,6 +341,9 @@ contract ACL is
         if (oldExpirationDate == newExpirationDate) {
             revert ExpirationDateAlreadySetToSameValue(msg.sender, delegate, contractAddress, oldExpirationDate);
         }
+
+        // Set the last block where the delegation happened.
+        userDecryptionDelegation.lastBlockDelegateOrRevoke = uint64(blockNumber);
 
         // Set the delegation expiration date.
         userDecryptionDelegation.expirationDate = newExpirationDate;
@@ -400,6 +435,16 @@ contract ACL is
     }
 
     /**
+     * @notice Returns the timestamp before which the account's decryption signatures are invalidated.
+     * @param account The account whose invalidation timestamp is queried.
+     * @return invalidatedBefore The oldest timestamp that remains valid.
+     */
+    function decryptionSignatureInvalidatedBefore(address account) public view virtual returns (uint256) {
+        ACLStorage storage $ = _getACLStorage();
+        return $.decryptionSignatureInvalidatedBefore[account];
+    }
+
+    /**
      * @notice Checks whether the account is allowed to use the handle in the
      * same transaction (transient).
      * @param handle Handle.
@@ -420,7 +465,7 @@ contract ACL is
      * @return fhevmExecutorAddress Address of the FHEVMExecutor.
      */
     function getFHEVMExecutorAddress() public view virtual returns (address) {
-        return fhevmExecutorAddress;
+        return FHEVM_EXECUTOR_ADDRESS;
     }
 
     /**
@@ -454,9 +499,13 @@ contract ACL is
 
     /**
      * @notice Returns whether an account is delegated to access the handle for user decryption.
+     * @dev Succeeds when the delegator and `contractAddress` are both persistently allowed on the handle, and either
+     *      a non-expired delegation exists for `(delegator, delegate, contractAddress)` or for
+     *      `(delegator, delegate, WILDCARD_DELEGATION_ADDRESS)`. Wildcard does not bypass `allow`; it only avoids per-contract
+     *      delegation entries.
      * @param delegator The address of the account that delegates access to its handles.
      * @param delegate The address of the account that receives the delegation.
-     * @param contractAddress The contract address to delegate access to.
+     * @param contractAddress The app contract associated with the handle for this check.
      * @param handle The handle to check for delegated user decryption.
      * @return isDelegatedForUserDecryption Whether the handle can be accessed for delegated user decryption.
      */
@@ -467,13 +516,12 @@ contract ACL is
         bytes32 handle
     ) public view virtual returns (bool) {
         ACLStorage storage $ = _getACLStorage();
-        UserDecryptionDelegation storage userDecryptionDelegation = $.userDecryptionDelegations[delegator][delegate][
-            contractAddress
-        ];
+        if (!$.persistedAllowedPairs[handle][delegator] || !$.persistedAllowedPairs[handle][contractAddress]) {
+            return false;
+        }
         return
-            $.persistedAllowedPairs[handle][delegator] &&
-            $.persistedAllowedPairs[handle][contractAddress] &&
-            userDecryptionDelegation.expirationDate >= block.timestamp;
+            _isUserDecryptionDelegationActive($, delegator, delegate, WILDCARD_DELEGATION_ADDRESS) ||
+            _isUserDecryptionDelegationActive($, delegator, delegate, contractAddress);
     }
 
     /**
@@ -576,12 +624,23 @@ contract ACL is
      */
     function _authorizeUpgrade(address _newImplementation) internal virtual override onlyOwner {}
 
+    /// @dev Looks up `userDecryptionDelegations[delegator][delegate][contractAddress]`.
+    /// @param contractAddress App contract from the decryption request, or `WILDCARD_DELEGATION_ADDRESS` for the wildcard row.
+    function _isUserDecryptionDelegationActive(
+        ACLStorage storage $,
+        address delegator,
+        address delegate,
+        address contractAddress
+    ) private view returns (bool) {
+        return $.userDecryptionDelegations[delegator][delegate][contractAddress].expirationDate > block.timestamp;
+    }
+
     /**
      * @dev Returns the ACL storage location.
      */
     function _getACLStorage() internal pure returns (ACLStorage storage $) {
         assembly {
-            $.slot := ACLStorageLocation
+            $.slot := ACL_STORAGE_LOCATION
         }
     }
 }

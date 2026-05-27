@@ -18,6 +18,7 @@ import { Coprocessor } from "./shared/Structs.sol";
  * @title InputVerification smart contract
  * @notice See {IInputVerification}
  */
+/// @custom:security-contact https://github.com/zama-ai/fhevm/blob/main/SECURITY.md
 contract InputVerification is
     IInputVerification,
     EIP712Upgradeable,
@@ -80,7 +81,7 @@ contract InputVerification is
      */
     string private constant CONTRACT_NAME = "InputVerification";
     uint256 private constant MAJOR_VERSION = 0;
-    uint256 private constant MINOR_VERSION = 3;
+    uint256 private constant MINOR_VERSION = 4;
     uint256 private constant PATCH_VERSION = 0;
 
     /**
@@ -89,7 +90,7 @@ contract InputVerification is
      * This constant does not represent the number of time a specific contract have been upgraded,
      * as a contract deployed from version VX will have a REINITIALIZER_VERSION > 2.
      */
-    uint64 private constant REINITIALIZER_VERSION = 4;
+    uint64 private constant REINITIALIZER_VERSION = 5;
 
     /**
      * @notice The contract's variable storage struct (@dev see ERC-7201)
@@ -162,11 +163,11 @@ contract InputVerification is
     }
 
     /**
-     * @notice Re-initializes the contract from V2.
+     * @notice Re-initializes the contract from V3.
      */
     /// @custom:oz-upgrades-unsafe-allow missing-initializer-call
     /// @custom:oz-upgrades-validate-as-initializer
-    function reinitializeV3() public virtual reinitializer(REINITIALIZER_VERSION) {}
+    function reinitializeV4() public virtual reinitializer(REINITIALIZER_VERSION) {}
 
     /**
      * @notice See {IInputVerification-verifyProofRequest}.
@@ -282,9 +283,7 @@ contract InputVerification is
         }
     }
 
-    /**
-     * @notice See {IInputVerification-rejectProofResponse}.
-     */
+    /// @notice See {IInputVerification-rejectProofResponse}.
     function rejectProofResponse(uint256 zkProofId, bytes calldata extraData) external virtual onlyCoprocessorTxSender {
         InputVerificationStorage storage $ = _getInputVerificationStorage();
 

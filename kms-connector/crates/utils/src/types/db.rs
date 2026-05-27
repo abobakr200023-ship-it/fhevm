@@ -1,8 +1,17 @@
-use crate::types::GatewayEventKind;
-use alloy::primitives::{Address, U256};
+use crate::types::ProtocolEventKind;
+use alloy::{
+    primitives::{Address, B256, U256},
+    sol_types::SolEvent,
+};
 use anyhow::anyhow;
-use fhevm_gateway_bindings::{
-    decryption::Decryption::SnsCiphertextMaterial, kms_generation::IKMSGeneration::KeyDigest,
+use fhevm_gateway_bindings::decryption::Decryption::{
+    PublicDecryptionRequest, SnsCiphertextMaterial,
+    UserDecryptionRequest_0 as UserDecryptionRequest,
+    UserDecryptionRequest_1 as UserDecryptionRequestV2,
+};
+use fhevm_host_bindings::kms_generation::{
+    IKMSGeneration::KeyDigest,
+    KMSGeneration::{CrsgenRequest, KeygenRequest, PrepKeygenRequest},
 };
 use sqlx::postgres::PgNotification;
 use std::{fmt::Display, str::FromStr};
@@ -11,10 +20,10 @@ use std::{fmt::Display, str::FromStr};
 #[derive(sqlx::Type, Clone, Debug, Default, PartialEq)]
 #[sqlx(type_name = "sns_ciphertext_material")]
 pub struct SnsCiphertextMaterialDbItem {
-    ct_handle: [u8; 32],
-    key_id: [u8; 32],
-    sns_ciphertext_digest: [u8; 32],
-    coprocessor_tx_sender_addresses: Vec<[u8; 20]>,
+    pub ct_handle: [u8; 32],
+    pub key_id: [u8; 32],
+    pub sns_ciphertext_digest: [u8; 32],
+    pub coprocessor_tx_sender_addresses: Vec<[u8; 20]>,
 }
 
 impl From<&SnsCiphertextMaterial> for SnsCiphertextMaterialDbItem {
@@ -130,8 +139,6 @@ pub enum EventType {
     PrepKeygenRequest,
     KeygenRequest,
     CrsgenRequest,
-    PrssInit,
-    KeyReshareSameSet,
 }
 
 impl Display for EventType {
@@ -142,22 +149,22 @@ impl Display for EventType {
             EventType::PrepKeygenRequest => write!(f, "PrepKeygenRequest"),
             EventType::KeygenRequest => write!(f, "KeygenRequest"),
             EventType::CrsgenRequest => write!(f, "CrsgenRequest"),
-            EventType::PrssInit => write!(f, "PrssInit"),
-            EventType::KeyReshareSameSet => write!(f, "KeyReshareSameSet"),
         }
     }
 }
 
-impl From<&GatewayEventKind> for EventType {
-    fn from(value: &GatewayEventKind) -> Self {
+impl From<&ProtocolEventKind> for EventType {
+    fn from(value: &ProtocolEventKind) -> Self {
         match value {
-            GatewayEventKind::PublicDecryption(_) => Self::PublicDecryptionRequest,
-            GatewayEventKind::UserDecryption(_) => Self::UserDecryptionRequest,
-            GatewayEventKind::PrepKeygen(_) => Self::PrepKeygenRequest,
-            GatewayEventKind::Keygen(_) => Self::KeygenRequest,
-            GatewayEventKind::Crsgen(_) => Self::CrsgenRequest,
-            GatewayEventKind::PrssInit(_) => Self::PrssInit,
-            GatewayEventKind::KeyReshareSameSet(_) => Self::KeyReshareSameSet,
+            ProtocolEventKind::PublicDecryption(_) => Self::PublicDecryptionRequest,
+            // Both legacy and RFC016 variants share the same `user_decryption_requests` table
+            // and the same `UserDecryptionRequest` event type for `last_block_polled` bookkeeping.
+            ProtocolEventKind::UserDecryption(_) | ProtocolEventKind::UserDecryptionV2(_) => {
+                Self::UserDecryptionRequest
+            }
+            ProtocolEventKind::PrepKeygen(_) => Self::PrepKeygenRequest,
+            ProtocolEventKind::Keygen(_) => Self::KeygenRequest,
+            ProtocolEventKind::Crsgen(_) => Self::CrsgenRequest,
         }
     }
 }
@@ -172,8 +179,6 @@ impl TryFrom<PgNotification> for EventType {
             PREP_KEYGEN_REQUEST_NOTIFICATION => Ok(Self::PrepKeygenRequest),
             KEYGEN_REQUEST_NOTIFICATION => Ok(Self::KeygenRequest),
             CRSGEN_REQUEST_NOTIFICATION => Ok(Self::CrsgenRequest),
-            PRSS_INIT_NOTIFICATION => Ok(Self::PrssInit),
-            KEY_RESHARE_SAME_SET_NOTIFICATION => Ok(Self::KeyReshareSameSet),
             s => Err(anyhow!("Unknown notification channel: {s}")),
         }
     }
@@ -187,8 +192,6 @@ impl EventType {
             Self::PrepKeygenRequest => PREP_KEYGEN_REQUEST_NOTIFICATION,
             Self::KeygenRequest => KEYGEN_REQUEST_NOTIFICATION,
             Self::CrsgenRequest => CRSGEN_REQUEST_NOTIFICATION,
-            Self::PrssInit => PRSS_INIT_NOTIFICATION,
-            Self::KeyReshareSameSet => KEY_RESHARE_SAME_SET_NOTIFICATION,
         }
     }
 
@@ -199,8 +202,31 @@ impl EventType {
             EventType::PrepKeygenRequest => "prep_keygen_request",
             EventType::KeygenRequest => "keygen_request",
             EventType::CrsgenRequest => "crsgen_request",
-            EventType::PrssInit => "prss_init",
-            EventType::KeyReshareSameSet => "key_reshare_same_set",
+        }
+    }
+
+    pub fn signature_hash(&self) -> B256 {
+        match self {
+            EventType::PublicDecryptionRequest => PublicDecryptionRequest::SIGNATURE_HASH,
+            EventType::UserDecryptionRequest => UserDecryptionRequest::SIGNATURE_HASH,
+            EventType::PrepKeygenRequest => PrepKeygenRequest::SIGNATURE_HASH,
+            EventType::KeygenRequest => KeygenRequest::SIGNATURE_HASH,
+            EventType::CrsgenRequest => CrsgenRequest::SIGNATURE_HASH,
+        }
+    }
+
+    /// Returns every topic0 hash that maps to this `EventType` in the Gateway ABI.
+    ///
+    /// `UserDecryptionRequest` currently covers two overloaded events — the legacy shape and the
+    /// RFC016 shape — so both topic0 hashes must be listed in the `eth_getLogs` filter. All other
+    /// event types map one-to-one to a single topic0.
+    pub fn signature_hashes(&self) -> Vec<B256> {
+        match self {
+            EventType::UserDecryptionRequest => vec![
+                UserDecryptionRequest::SIGNATURE_HASH,
+                UserDecryptionRequestV2::SIGNATURE_HASH,
+            ],
+            _ => vec![self.signature_hash()],
         }
     }
 }
@@ -211,9 +237,6 @@ pub const USER_DECRYPT_REQUEST_NOTIFICATION: &str = "user_decryption_request_ava
 pub const PREP_KEYGEN_REQUEST_NOTIFICATION: &str = "prep_keygen_request_available";
 pub const KEYGEN_REQUEST_NOTIFICATION: &str = "keygen_request_available";
 pub const CRSGEN_REQUEST_NOTIFICATION: &str = "crsgen_request_available";
-pub const PRSS_INIT_NOTIFICATION: &str = "prss_init_available";
-pub const KEY_RESHARE_SAME_SET_NOTIFICATION: &str = "key_reshare_same_set_available";
-
 #[derive(sqlx::Type, Copy, Clone, Debug, PartialEq)]
 #[sqlx(type_name = "operation_status", rename_all = "lowercase")]
 pub enum OperationStatus {

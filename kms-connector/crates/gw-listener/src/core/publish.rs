@@ -1,74 +1,74 @@
-use std::time::Duration;
-
 use alloy::primitives::{FixedBytes, U256};
 use anyhow::anyhow;
 use connector_utils::{
     monitoring::otlp::PropagationContext,
     types::{
-        GatewayEvent, GatewayEventKind,
+        ProtocolEvent, ProtocolEventKind,
         db::{EventType, ParamsTypeDb, SnsCiphertextMaterialDbItem},
     },
 };
-use fhevm_gateway_bindings::{
-    decryption::Decryption::{PublicDecryptionRequest, UserDecryptionRequest},
-    kms_generation::KMSGeneration::{
-        CrsgenRequest, KeyReshareSameSet, KeygenRequest, PrepKeygenRequest,
-    },
+use fhevm_gateway_bindings::decryption::Decryption::{
+    PublicDecryptionRequest, UserDecryptionRequest_0 as UserDecryptionRequest,
+    UserDecryptionRequest_1 as UserDecryptionRequestV2,
 };
-use sqlx::{Pool, Postgres, postgres::PgQueryResult};
-use tracing::{debug, error, info, warn};
+use fhevm_host_bindings::kms_generation::KMSGeneration::{
+    CrsgenRequest, KeygenRequest, PrepKeygenRequest,
+};
+use sqlx::{
+    PgExecutor, Pool, Postgres,
+    postgres::PgQueryResult,
+    types::chrono::{DateTime, Utc},
+};
+use tracing::{debug, info, warn};
 
-const INSERTION_RETRY_LIMIT: usize = 10;
-const INSERTION_RETRY_INTERVAL: Duration = Duration::from_millis(10);
-
+/// Inserts all events and updates the last block polled in a single transaction.
+/// On failure, the transaction is rolled back automatically.
 #[tracing::instrument(skip_all)]
-pub async fn publish_event(
+pub async fn publish_batch(
     db_pool: &Pool<Postgres>,
-    event: GatewayEvent,
-    block_number: Option<u64>,
+    events: Vec<ProtocolEvent>,
+    event_types: &[EventType],
+    block_number: u64,
 ) -> anyhow::Result<()> {
-    for i in 1..=INSERTION_RETRY_LIMIT {
-        match publish_event_inner(db_pool, event.clone(), block_number).await {
-            Ok(()) => return Ok(()),
-            Err(e) => error!("Insertion attempt #{i}/{INSERTION_RETRY_LIMIT} failed: {e}"),
-        }
-        if i != INSERTION_RETRY_LIMIT {
-            tokio::time::sleep(INSERTION_RETRY_INTERVAL).await;
-        }
+    let mut tx = db_pool.begin().await?;
+    for event in events {
+        publish_event_inner(&mut *tx, event).await?;
     }
-
-    Err(anyhow::anyhow!(
-        "Failed to publish {:?} event after {} attempts",
-        event.kind,
-        INSERTION_RETRY_LIMIT
-    ))
+    update_last_block_polled(&mut *tx, event_types, Some(block_number)).await?;
+    tx.commit().await?;
+    Ok(())
 }
 
-async fn publish_event_inner(
-    db_pool: &Pool<Postgres>,
-    event: GatewayEvent,
-    block_number: Option<u64>,
+async fn publish_event_inner<'e>(
+    executor: impl PgExecutor<'e>,
+    event: ProtocolEvent,
 ) -> anyhow::Result<()> {
-    info!(block_number, "Storing {:?} in DB...", event.kind);
+    info!("Storing {:?} in DB...", event.kind);
 
-    let event_type = (&event.kind).into();
     let otlp_ctx = event.otlp_context;
     let tx_hash = event.tx_hash;
+    let created_at = event.created_at;
     let query_result = match event.kind {
-        GatewayEventKind::PublicDecryption(e) => {
-            publish_public_decryption(db_pool, e, tx_hash, otlp_ctx).await
+        ProtocolEventKind::PublicDecryption(e) => {
+            publish_public_decryption(executor, e, tx_hash, created_at, otlp_ctx).await
         }
-        GatewayEventKind::UserDecryption(e) => {
-            publish_user_decryption(db_pool, e, tx_hash, otlp_ctx).await
+        ProtocolEventKind::UserDecryption(e) => {
+            publish_user_decryption(executor, e, tx_hash, created_at, otlp_ctx).await
         }
-        GatewayEventKind::PrepKeygen(e) => {
-            publish_prep_keygen_request(db_pool, e, tx_hash, otlp_ctx).await
+        ProtocolEventKind::UserDecryptionV2(e) => {
+            publish_user_decryption_v2(executor, e, tx_hash, created_at, otlp_ctx).await
         }
-        GatewayEventKind::Keygen(e) => publish_keygen_request(db_pool, e, tx_hash, otlp_ctx).await,
-        GatewayEventKind::Crsgen(e) => publish_crsgen_request(db_pool, e, tx_hash, otlp_ctx).await,
-        GatewayEventKind::PrssInit(id) => publish_prss_init(db_pool, id, tx_hash, otlp_ctx).await,
-        GatewayEventKind::KeyReshareSameSet(e) => {
-            publish_key_reshare_same_set(db_pool, e, tx_hash, otlp_ctx).await
+        ProtocolEventKind::PrepKeygen(e) => {
+            let params_type: ParamsTypeDb = e.paramsType.try_into()?;
+            publish_prep_keygen_request(executor, e, params_type, tx_hash, created_at, otlp_ctx)
+                .await
+        }
+        ProtocolEventKind::Keygen(e) => {
+            publish_keygen_request(executor, e, tx_hash, created_at, otlp_ctx).await
+        }
+        ProtocolEventKind::Crsgen(e) => {
+            let params_type: ParamsTypeDb = e.paramsType.try_into()?;
+            publish_crsgen_request(executor, e, params_type, tx_hash, created_at, otlp_ctx).await
         }
     }
     .map_err(|err| anyhow!("Failed to publish event: {err}"))?;
@@ -79,14 +79,14 @@ async fn publish_event_inner(
         warn!("Unexpected query result while publishing event: {query_result:?}");
     }
 
-    update_last_block_polled(db_pool, event_type, block_number).await?;
     Ok(())
 }
 
-async fn publish_public_decryption(
-    db_pool: &Pool<Postgres>,
+async fn publish_public_decryption<'e>(
+    executor: impl PgExecutor<'e>,
     request: PublicDecryptionRequest,
     tx_hash: Option<FixedBytes<32>>,
+    created_at: DateTime<Utc>,
     otlp_ctx: PropagationContext,
 ) -> anyhow::Result<PgQueryResult> {
     let sns_ciphertexts_db = request
@@ -96,23 +96,27 @@ async fn publish_public_decryption(
         .collect::<Vec<SnsCiphertextMaterialDbItem>>();
 
     sqlx::query!(
-            "INSERT INTO public_decryption_requests(decryption_id, sns_ct_materials, extra_data, tx_hash, otlp_context) \
-            VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-            request.decryptionId.as_le_slice(),
-            sns_ciphertexts_db as Vec<SnsCiphertextMaterialDbItem>,
-            request.extraData.as_ref(),
-            tx_hash.map(|h| h.to_vec()),
-            bc2wrap::serialize(&otlp_ctx)?,
-        )
-        .execute(db_pool)
-        .await
-        .map_err(anyhow::Error::from)
+        "INSERT INTO public_decryption_requests(\
+            decryption_id, sns_ct_materials, extra_data, tx_hash, created_at, otlp_context\
+        ) \
+        VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        request.decryptionId.as_le_slice(),
+        sns_ciphertexts_db as Vec<SnsCiphertextMaterialDbItem>,
+        request.extraData.as_ref(),
+        tx_hash.map(|h| h.to_vec()),
+        created_at,
+        bc2wrap::serialize(&otlp_ctx)?,
+    )
+    .execute(executor)
+    .await
+    .map_err(anyhow::Error::from)
 }
 
-async fn publish_user_decryption(
-    db_pool: &Pool<Postgres>,
+async fn publish_user_decryption<'e>(
+    executor: impl PgExecutor<'e>,
     request: UserDecryptionRequest,
     tx_hash: Option<FixedBytes<32>>,
+    created_at: DateTime<Utc>,
     otlp_ctx: PropagationContext,
 ) -> anyhow::Result<PgQueryResult> {
     let sns_ciphertexts_db = request
@@ -121,160 +125,231 @@ async fn publish_user_decryption(
         .map(SnsCiphertextMaterialDbItem::from)
         .collect::<Vec<SnsCiphertextMaterialDbItem>>();
 
+    // RFC016-specific columns (`handle_owner_addresses`, `handle_contract_addresses`,
+    // `allowed_contracts`, `start_timestamp`, `duration_seconds`, `signature`) are left unset —
+    // they default to NULL for legacy rows, which is what the reader uses to identify the variant.
     sqlx::query!(
         "INSERT INTO user_decryption_requests(\
-            decryption_id, sns_ct_materials, user_address, public_key, extra_data, tx_hash, otlp_context\
+            decryption_id, sns_ct_materials, user_address, public_key, extra_data, tx_hash,\
+            created_at, otlp_context\
         ) \
-        VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
         request.decryptionId.as_le_slice(),
         sns_ciphertexts_db as Vec<SnsCiphertextMaterialDbItem>,
         request.userAddress.as_slice(),
         request.publicKey.as_ref(),
         request.extraData.as_ref(),
         tx_hash.map(|h| h.to_vec()),
+        created_at,
         bc2wrap::serialize(&otlp_ctx)?,
     )
-    .execute(db_pool)
+    .execute(executor)
     .await
     .map_err(anyhow::Error::from)
 }
 
-async fn publish_prep_keygen_request(
-    db_pool: &Pool<Postgres>,
-    request: PrepKeygenRequest,
+async fn publish_user_decryption_v2<'e>(
+    executor: impl PgExecutor<'e>,
+    request: UserDecryptionRequestV2,
     tx_hash: Option<FixedBytes<32>>,
+    created_at: DateTime<Utc>,
     otlp_ctx: PropagationContext,
 ) -> anyhow::Result<PgQueryResult> {
-    let params_type: ParamsTypeDb = request.paramsType.try_into()?;
+    let sns_ciphertexts_db = request
+        .snsCtMaterials
+        .iter()
+        .map(SnsCiphertextMaterialDbItem::from)
+        .collect::<Vec<SnsCiphertextMaterialDbItem>>();
+
+    let handle_owner_addresses: Vec<Vec<u8>> = request
+        .handles
+        .iter()
+        .map(|h| h.ownerAddress.to_vec())
+        .collect();
+    let handle_contract_addresses: Vec<Vec<u8>> = request
+        .handles
+        .iter()
+        .map(|h| h.contractAddress.to_vec())
+        .collect();
+    let payload = &request.payload;
+    let allowed_contracts: Vec<Vec<u8>> = payload
+        .allowedContracts
+        .iter()
+        .map(|a| a.to_vec())
+        .collect();
+
+    // `startTimestamp` and `durationSeconds` are `uint256` on-chain but Unix-epoch seconds in
+    // practice, so they fit easily in `BIGINT`. A Gateway emitting values past i64::MAX would be
+    // broken; we surface that as an error rather than silently truncating.
+    let start_timestamp: i64 = payload
+        .requestValidity
+        .startTimestamp
+        .try_into()
+        .map_err(|_| anyhow!("RFC016 startTimestamp does not fit in i64"))?;
+    let duration_seconds: i64 = payload
+        .requestValidity
+        .durationSeconds
+        .try_into()
+        .map_err(|_| anyhow!("RFC016 durationSeconds does not fit in i64"))?;
+
+    sqlx::query!(
+        "INSERT INTO user_decryption_requests(\
+            decryption_id, sns_ct_materials, user_address, public_key, extra_data, tx_hash,\
+            created_at, otlp_context, handle_owner_addresses, handle_contract_addresses,\
+            allowed_contracts, start_timestamp, duration_seconds, signature\
+        ) \
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14) \
+        ON CONFLICT DO NOTHING",
+        request.decryptionId.as_le_slice(),
+        sns_ciphertexts_db as Vec<SnsCiphertextMaterialDbItem>,
+        payload.userAddress.as_slice(),
+        payload.publicKey.as_ref(),
+        payload.extraData.as_ref(),
+        tx_hash.map(|h| h.to_vec()),
+        created_at,
+        bc2wrap::serialize(&otlp_ctx)?,
+        &handle_owner_addresses,
+        &handle_contract_addresses,
+        &allowed_contracts,
+        start_timestamp,
+        duration_seconds,
+        payload.signature.as_ref(),
+    )
+    .execute(executor)
+    .await
+    .map_err(anyhow::Error::from)
+}
+
+async fn publish_prep_keygen_request<'e>(
+    executor: impl PgExecutor<'e>,
+    request: PrepKeygenRequest,
+    params_type: ParamsTypeDb,
+    tx_hash: Option<FixedBytes<32>>,
+    created_at: DateTime<Utc>,
+    otlp_ctx: PropagationContext,
+) -> anyhow::Result<PgQueryResult> {
     sqlx::query!(
         "INSERT INTO prep_keygen_requests(\
-            prep_keygen_id, epoch_id, params_type, tx_hash, otlp_context\
-        ) \
-        VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-        request.prepKeygenId.as_le_slice(),
-        request.epochId.as_le_slice(),
-        params_type as ParamsTypeDb,
-        tx_hash.map(|h| h.to_vec()),
-        bc2wrap::serialize(&otlp_ctx)?,
-    )
-    .execute(db_pool)
-    .await
-    .map_err(anyhow::Error::from)
-}
-
-async fn publish_keygen_request(
-    db_pool: &Pool<Postgres>,
-    request: KeygenRequest,
-    tx_hash: Option<FixedBytes<32>>,
-    otlp_ctx: PropagationContext,
-) -> anyhow::Result<PgQueryResult> {
-    sqlx::query!(
-        "INSERT INTO keygen_requests(prep_keygen_id, key_id, tx_hash, otlp_context) \
-            VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
-        request.prepKeygenId.as_le_slice(),
-        request.keyId.as_le_slice(),
-        tx_hash.map(|h| h.to_vec()),
-        bc2wrap::serialize(&otlp_ctx)?,
-    )
-    .execute(db_pool)
-    .await
-    .map_err(anyhow::Error::from)
-}
-
-async fn publish_crsgen_request(
-    db_pool: &Pool<Postgres>,
-    request: CrsgenRequest,
-    tx_hash: Option<FixedBytes<32>>,
-    otlp_ctx: PropagationContext,
-) -> anyhow::Result<PgQueryResult> {
-    let params_type: ParamsTypeDb = request.paramsType.try_into()?;
-    sqlx::query!(
-        "INSERT INTO crsgen_requests(crs_id, max_bit_length, params_type, tx_hash, otlp_context) \
-            VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
-        request.crsId.as_le_slice(),
-        request.maxBitLength.as_le_slice(),
-        params_type as ParamsTypeDb,
-        tx_hash.map(|h| h.to_vec()),
-        bc2wrap::serialize(&otlp_ctx)?,
-    )
-    .execute(db_pool)
-    .await
-    .map_err(anyhow::Error::from)
-}
-
-async fn publish_prss_init(
-    db_pool: &Pool<Postgres>,
-    id: U256,
-    tx_hash: Option<FixedBytes<32>>,
-    otlp_ctx: PropagationContext,
-) -> anyhow::Result<PgQueryResult> {
-    sqlx::query!(
-        "INSERT INTO prss_init(id, tx_hash, otlp_context) \
-            VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
-        id.as_le_slice(),
-        tx_hash.map(|h| h.to_vec()),
-        bc2wrap::serialize(&otlp_ctx)?,
-    )
-    .execute(db_pool)
-    .await
-    .map_err(anyhow::Error::from)
-}
-
-async fn publish_key_reshare_same_set(
-    db_pool: &Pool<Postgres>,
-    request: KeyReshareSameSet,
-    tx_hash: Option<FixedBytes<32>>,
-    otlp_ctx: PropagationContext,
-) -> anyhow::Result<PgQueryResult> {
-    let params_type: ParamsTypeDb = request.paramsType.try_into()?;
-    sqlx::query!(
-        "INSERT INTO key_reshare_same_set(\
-            prep_keygen_id, key_id, key_reshare_id, params_type, tx_hash, otlp_context\
+            prep_keygen_id, params_type, extra_data, tx_hash, created_at, otlp_context\
         ) \
         VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
         request.prepKeygenId.as_le_slice(),
-        request.keyId.as_le_slice(),
-        request.keyReshareId.as_le_slice(),
         params_type as ParamsTypeDb,
+        request.extraData.as_ref(),
         tx_hash.map(|h| h.to_vec()),
+        created_at,
         bc2wrap::serialize(&otlp_ctx)?,
     )
-    .execute(db_pool)
+    .execute(executor)
     .await
     .map_err(anyhow::Error::from)
 }
 
-/// Updates the registered last block polled in DB.
+async fn publish_keygen_request<'e>(
+    executor: impl PgExecutor<'e>,
+    request: KeygenRequest,
+    tx_hash: Option<FixedBytes<32>>,
+    created_at: DateTime<Utc>,
+    otlp_ctx: PropagationContext,
+) -> anyhow::Result<PgQueryResult> {
+    sqlx::query!(
+        "INSERT INTO keygen_requests(prep_keygen_id, key_id, extra_data, tx_hash, created_at, otlp_context) \
+            VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        request.prepKeygenId.as_le_slice(),
+        request.keyId.as_le_slice(),
+        request.extraData.as_ref(),
+        tx_hash.map(|h| h.to_vec()),
+        created_at,
+        bc2wrap::serialize(&otlp_ctx)?,
+    )
+    .execute(executor)
+    .await
+    .map_err(anyhow::Error::from)
+}
+
+async fn publish_crsgen_request<'e>(
+    executor: impl PgExecutor<'e>,
+    request: CrsgenRequest,
+    params_type: ParamsTypeDb,
+    tx_hash: Option<FixedBytes<32>>,
+    created_at: DateTime<Utc>,
+    otlp_ctx: PropagationContext,
+) -> anyhow::Result<PgQueryResult> {
+    sqlx::query!(
+        "INSERT INTO crsgen_requests(\
+            crs_id, max_bit_length, params_type, extra_data, tx_hash, created_at, otlp_context\
+        ) \
+        VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+        request.crsId.as_le_slice(),
+        request.maxBitLength.as_le_slice(),
+        params_type as ParamsTypeDb,
+        request.extraData.as_ref(),
+        tx_hash.map(|h| h.to_vec()),
+        created_at,
+        bc2wrap::serialize(&otlp_ctx)?,
+    )
+    .execute(executor)
+    .await
+    .map_err(anyhow::Error::from)
+}
+
+/// Updates the registered last block polled in DB for the given event types.
 #[tracing::instrument(skip_all)]
-pub async fn update_last_block_polled(
-    db_pool: &Pool<Postgres>,
-    event_type: EventType,
+pub async fn update_last_block_polled<'e>(
+    executor: impl PgExecutor<'e>,
+    event_types: &[EventType],
     last_block_polled: Option<u64>,
 ) -> anyhow::Result<()> {
     info!(
         last_block_polled,
-        "Updating last block polled in DB for {event_type}"
+        "Updating last block polled in DB for {event_types:?}"
     );
     let query_result = sqlx::query!(
-        "UPDATE last_block_polled SET block_number = $2 \
-        WHERE event_type = $1 AND (block_number IS NULL OR block_number < $2)",
-        event_type as EventType,
+        "UPDATE last_block_polled SET block_number = $2, updated_at = $3 \
+        WHERE event_type = ANY($1::event_type[]) AND (block_number IS NULL OR block_number < $2)",
+        event_types as &[EventType],
         last_block_polled.map(|n| n as i64),
+        Utc::now(),
+    )
+    .execute(executor)
+    .await?;
+
+    let rows_affected = query_result.rows_affected();
+    if rows_affected > 0 {
+        info!(
+            last_block_polled,
+            "Last block polled updated for {}/{} event types in {event_types:?}",
+            rows_affected,
+            event_types.len()
+        );
+    } else {
+        debug!(
+            last_block_polled,
+            "Last block polled for {event_types:?} was not updated: {query_result:?}"
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn publish_context_id(db_pool: &Pool<Postgres>, context_id: U256) -> anyhow::Result<()> {
+    info!("Publishing KMS context #{context_id} in DB...");
+    let now = Utc::now();
+    let query_result = sqlx::query!(
+        "INSERT INTO kms_context(id, is_valid, created_at, updated_at) \
+        VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        context_id.as_le_slice(),
+        true,
+        now,
+        now,
     )
     .execute(db_pool)
     .await?;
 
     if query_result.rows_affected() == 1 {
-        info!(
-            last_block_polled,
-            "Last block polled for {event_type} was successfully updated!"
-        );
+        info!("KMS context #{context_id} was successfully published!");
     } else {
-        debug!(
-            last_block_polled,
-            "Last block polled for {event_type} was not updated: {query_result:?}"
-        );
+        debug!("KMS context #{context_id} was not published: {query_result:?}");
     }
-
     Ok(())
 }

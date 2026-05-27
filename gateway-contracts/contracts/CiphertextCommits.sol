@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: BSD-3-Clause-Clear
 pragma solidity ^0.8.24;
-import { gatewayConfigAddress, kmsGenerationAddress } from "../addresses/GatewayAddresses.sol";
+import { gatewayConfigAddress } from "../addresses/GatewayAddresses.sol";
 import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
 import { ICiphertextCommits } from "./interfaces/ICiphertextCommits.sol";
 import { IGatewayConfig } from "./interfaces/IGatewayConfig.sol";
-import { IKMSGeneration } from "./interfaces/IKMSGeneration.sol";
 import { UUPSUpgradeableEmptyProxy } from "./shared/UUPSUpgradeableEmptyProxy.sol";
 import { GatewayConfigChecks } from "./shared/GatewayConfigChecks.sol";
 import { GatewayOwnable } from "./shared/GatewayOwnable.sol";
@@ -14,16 +13,12 @@ import { CiphertextMaterial, SnsCiphertextMaterial } from "./shared/Structs.sol"
  * @title CiphertextCommits smart contract
  * @notice See {ICiphertextCommits}.
  */
+/// @custom:security-contact https://github.com/zama-ai/fhevm/blob/main/SECURITY.md
 contract CiphertextCommits is ICiphertextCommits, UUPSUpgradeableEmptyProxy, GatewayOwnable, GatewayConfigChecks {
     /**
      * @notice The address of the GatewayConfig contract, used for fetching information about coprocessors.
      */
     IGatewayConfig private constant GATEWAY_CONFIG = IGatewayConfig(gatewayConfigAddress);
-
-    /**
-     * @notice The address of the KMSGeneration contract, used for fetching information about the current key.
-     */
-    IKMSGeneration private constant KMS_GENERATION = IKMSGeneration(kmsGenerationAddress);
 
     /**
      * @notice The domain separator for the add ciphertext hash.
@@ -38,7 +33,7 @@ contract CiphertextCommits is ICiphertextCommits, UUPSUpgradeableEmptyProxy, Gat
      */
     string private constant CONTRACT_NAME = "CiphertextCommits";
     uint256 private constant MAJOR_VERSION = 0;
-    uint256 private constant MINOR_VERSION = 3;
+    uint256 private constant MINOR_VERSION = 4;
     uint256 private constant PATCH_VERSION = 0;
 
     /**
@@ -47,7 +42,7 @@ contract CiphertextCommits is ICiphertextCommits, UUPSUpgradeableEmptyProxy, Gat
      * This constant does not represent the number of time a specific contract have been upgraded,
      * as a contract deployed from version VX will have a REINITIALIZER_VERSION > 2.
      */
-    uint64 private constant REINITIALIZER_VERSION = 4;
+    uint64 private constant REINITIALIZER_VERSION = 5;
 
     /**
      * @notice The contract's variable storage struct (@dev see ERC-7201)
@@ -109,11 +104,11 @@ contract CiphertextCommits is ICiphertextCommits, UUPSUpgradeableEmptyProxy, Gat
     function initializeFromEmptyProxy() public virtual onlyFromEmptyProxy reinitializer(REINITIALIZER_VERSION) {}
 
     /**
-     * @notice Re-initializes the contract from V2.
+     * @notice Re-initializes the contract from V3.
      */
     /// @custom:oz-upgrades-unsafe-allow missing-initializer-call
     /// @custom:oz-upgrades-validate-as-initializer
-    function reinitializeV3() public virtual reinitializer(REINITIALIZER_VERSION) {}
+    function reinitializeV4() public virtual reinitializer(REINITIALIZER_VERSION) {}
 
     /**
      * @notice See {ICiphertextCommits-addCiphertextMaterial}.
@@ -248,6 +243,9 @@ contract CiphertextCommits is ICiphertextCommits, UUPSUpgradeableEmptyProxy, Gat
         snsCtMaterials = new SnsCiphertextMaterial[](ctHandles.length);
 
         for (uint256 i = 0; i < ctHandles.length; i++) {
+            // Reject handles whose chain ID is unknown or has been disabled by the gateway owner.
+            _checkHandleFromRegisteredHostChain(ctHandles[i]);
+
             // Check that the consensus has been reached
             if (!isCiphertextMaterialAdded(ctHandles[i])) {
                 revert CiphertextMaterialNotFound(ctHandles[i]);

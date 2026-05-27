@@ -1,10 +1,9 @@
-import { assert } from 'chai';
+import { assert, expect } from 'chai';
 import { ethers } from 'hardhat';
 
 import type { FHEVMManualTestSuite } from '../../types/contracts/operations/FHEVMManualTestSuite';
 import { createInstance } from '../instance';
 import { getSigner } from '../signers';
-import { bigIntToBytes256 } from '../utils';
 
 async function deployFHEVMManualTestFixture(): Promise<FHEVMManualTestSuite> {
   const admin = await getSigner(119);
@@ -14,6 +13,37 @@ async function deployFHEVMManualTestFixture(): Promise<FHEVMManualTestSuite> {
   await contract.waitForDeployment();
 
   return contract;
+}
+
+const UINT64_MASK = (1n << 64n) - 1n;
+const OVERSIZED_SHIFT_64 = 70n;
+const REDUCED_SHIFT_64 = 6n;
+const SHIFT_ROTATE_VALUE_64 = 0x123456789abcdef0n;
+const addr = (value: string) => ethers.getAddress(value);
+const ADDR_A = addr('0x8ba1f109551bd432803012645ac136ddd64dba72');
+const ADDR_B = addr('0x8881f109551bd432803012645ac136ddd64dba72');
+const ADDR_C = addr('0x9ba1f109551bd432803012645ac136ddd64dba72');
+const ADDR_D = addr('0x9aa1f109551bd432803012645ac136ddd64dba72');
+
+function rotl64(value: bigint, shift: bigint): bigint {
+  const normalized = shift % 64n;
+  return ((value << normalized) | (value >> (64n - normalized))) & UINT64_MASK;
+}
+
+function rotr64(value: bigint, shift: bigint): bigint {
+  const normalized = shift % 64n;
+  return ((value >> normalized) | (value << (64n - normalized))) & UINT64_MASK;
+}
+
+async function decrypt64Result(
+  instance: Awaited<ReturnType<typeof createInstance>>,
+  contract: FHEVMManualTestSuite,
+  txPromise: Promise<{ wait(): Promise<unknown> }>,
+): Promise<bigint> {
+  await (await txPromise).wait();
+  const handle = await contract.resEuint64();
+  const res = await instance.publicDecrypt([handle]);
+  return res.clearValues[handle as `0x${string}`] as bigint;
 }
 
 describe('FHEVM manual operations', function () {
@@ -27,12 +57,160 @@ describe('FHEVM manual operations', function () {
     this.instance = instance;
   });
 
+  // Keep this regression isolated so operators CI can target only the
+  // oversized-index path without pulling the whole manual suite.
+  describe('FHEVM oversized shift and rotate indexes', function () {
+    it('shr(euint64, uint8) applies modulo semantics for indexes > bit width', async function () {
+      const encryptedAmount = await this.instance.encryptTypedValues({
+        values: [{ type: 'uint64', value: SHIFT_ROTATE_VALUE_64 }],
+        contractAddress: this.contractAddress,
+        userAddress: this.signer.address,
+      });
+      const res = await decrypt64Result(
+        this.instance,
+        this.contract,
+        this.contract.test_shr_euint64_uint8(
+          encryptedAmount.handles[0],
+          OVERSIZED_SHIFT_64,
+          encryptedAmount.inputProof,
+        ),
+      );
+      assert.equal(res, SHIFT_ROTATE_VALUE_64 >> REDUCED_SHIFT_64);
+    });
+
+    it('shr(euint64, euint8) applies modulo semantics for indexes > bit width', async function () {
+      const encryptedAmount = await this.instance.encryptTypedValues({
+        values: [{ type: 'uint64', value: SHIFT_ROTATE_VALUE_64 }, { type: 'uint8', value: OVERSIZED_SHIFT_64 }],
+        contractAddress: this.contractAddress,
+        userAddress: this.signer.address,
+      });
+      const res = await decrypt64Result(
+        this.instance,
+        this.contract,
+        this.contract.test_shr_euint64_euint8(
+          encryptedAmount.handles[0],
+          encryptedAmount.handles[1],
+          encryptedAmount.inputProof,
+        ),
+      );
+      assert.equal(res, SHIFT_ROTATE_VALUE_64 >> REDUCED_SHIFT_64);
+    });
+
+    it('shl(euint64, uint8) applies modulo semantics for indexes > bit width', async function () {
+      const encryptedAmount = await this.instance.encryptTypedValues({
+        values: [{ type: 'uint64', value: SHIFT_ROTATE_VALUE_64 }],
+        contractAddress: this.contractAddress,
+        userAddress: this.signer.address,
+      });
+      const res = await decrypt64Result(
+        this.instance,
+        this.contract,
+        this.contract.test_shl_euint64_uint8(
+          encryptedAmount.handles[0],
+          OVERSIZED_SHIFT_64,
+          encryptedAmount.inputProof,
+        ),
+      );
+      assert.equal(res, (SHIFT_ROTATE_VALUE_64 << REDUCED_SHIFT_64) & UINT64_MASK);
+    });
+
+    it('shl(euint64, euint8) applies modulo semantics for indexes > bit width', async function () {
+      const encryptedAmount = await this.instance.encryptTypedValues({
+        values: [{ type: 'uint64', value: SHIFT_ROTATE_VALUE_64 }, { type: 'uint8', value: OVERSIZED_SHIFT_64 }],
+        contractAddress: this.contractAddress,
+        userAddress: this.signer.address,
+      });
+      const res = await decrypt64Result(
+        this.instance,
+        this.contract,
+        this.contract.test_shl_euint64_euint8(
+          encryptedAmount.handles[0],
+          encryptedAmount.handles[1],
+          encryptedAmount.inputProof,
+        ),
+      );
+      assert.equal(res, (SHIFT_ROTATE_VALUE_64 << REDUCED_SHIFT_64) & UINT64_MASK);
+    });
+
+    it('rotl(euint64, uint8) applies modulo semantics for indexes > bit width', async function () {
+      const encryptedAmount = await this.instance.encryptTypedValues({
+        values: [{ type: 'uint64', value: SHIFT_ROTATE_VALUE_64 }],
+        contractAddress: this.contractAddress,
+        userAddress: this.signer.address,
+      });
+      const res = await decrypt64Result(
+        this.instance,
+        this.contract,
+        this.contract.test_rotl_euint64_uint8(
+          encryptedAmount.handles[0],
+          OVERSIZED_SHIFT_64,
+          encryptedAmount.inputProof,
+        ),
+      );
+      assert.equal(res, rotl64(SHIFT_ROTATE_VALUE_64, REDUCED_SHIFT_64));
+    });
+
+    it('rotr(euint64, uint8) applies modulo semantics for indexes > bit width', async function () {
+      const encryptedAmount = await this.instance.encryptTypedValues({
+        values: [{ type: 'uint64', value: SHIFT_ROTATE_VALUE_64 }],
+        contractAddress: this.contractAddress,
+        userAddress: this.signer.address,
+      });
+      const res = await decrypt64Result(
+        this.instance,
+        this.contract,
+        this.contract.test_rotr_euint64_uint8(
+          encryptedAmount.handles[0],
+          OVERSIZED_SHIFT_64,
+          encryptedAmount.inputProof,
+        ),
+      );
+      assert.equal(res, rotr64(SHIFT_ROTATE_VALUE_64, REDUCED_SHIFT_64));
+    });
+
+    it('rotr(euint64, euint8) applies modulo semantics for indexes > bit width', async function () {
+      const encryptedAmount = await this.instance.encryptTypedValues({
+        values: [{ type: 'uint64', value: SHIFT_ROTATE_VALUE_64 }, { type: 'uint8', value: OVERSIZED_SHIFT_64 }],
+        contractAddress: this.contractAddress,
+        userAddress: this.signer.address,
+      });
+      const res = await decrypt64Result(
+        this.instance,
+        this.contract,
+        this.contract.test_rotr_euint64_euint8(
+          encryptedAmount.handles[0],
+          encryptedAmount.handles[1],
+          encryptedAmount.inputProof,
+        ),
+      );
+      assert.equal(res, rotr64(SHIFT_ROTATE_VALUE_64, REDUCED_SHIFT_64));
+    });
+
+    it('rotl(euint64, euint8) applies modulo semantics for indexes > bit width', async function () {
+      const encryptedAmount = await this.instance.encryptTypedValues({
+        values: [{ type: 'uint64', value: SHIFT_ROTATE_VALUE_64 }, { type: 'uint8', value: OVERSIZED_SHIFT_64 }],
+        contractAddress: this.contractAddress,
+        userAddress: this.signer.address,
+      });
+      const res = await decrypt64Result(
+        this.instance,
+        this.contract,
+        this.contract.test_rotl_euint64_euint8(
+          encryptedAmount.handles[0],
+          encryptedAmount.handles[1],
+          encryptedAmount.inputProof,
+        ),
+      );
+      assert.equal(res, rotl64(SHIFT_ROTATE_VALUE_64, REDUCED_SHIFT_64));
+    });
+  });
+
   it('Select works returning if false', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addBool(false);
-    input.add32(3);
-    input.add32(4);
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'bool', value: false }, { type: 'uint32', value: 3 }, { type: 'uint32', value: 4 }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
     const tx = await this.contract.test_select(
       encryptedAmount.handles[0],
       encryptedAmount.handles[1],
@@ -49,11 +227,11 @@ describe('FHEVM manual operations', function () {
   });
 
   it('Select works returning if true', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addBool(true);
-    input.add32(3);
-    input.add32(4);
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'bool', value: true }, { type: 'uint32', value: 3 }, { type: 'uint32', value: 4 }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
     const tx = await this.contract.test_select(
       encryptedAmount.handles[0],
       encryptedAmount.handles[1],
@@ -85,11 +263,11 @@ describe('FHEVM manual operations', function () {
   });
 
   it('Select works for eaddress returning if false', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addBool(false);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    input.addAddress('0x8881f109551bd432803012645ac136ddd64dba72');
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'bool', value: false }, { type: 'address', value: ADDR_A }, { type: 'address', value: ADDR_B }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
     const tx = await this.contract.test_select_eaddress(
       encryptedAmount.handles[0],
       encryptedAmount.handles[1],
@@ -100,17 +278,17 @@ describe('FHEVM manual operations', function () {
     const handle = await this.contract.resAdd();
     const res = await this.instance.publicDecrypt([handle]);
     const expectedRes = {
-      [handle]: ethers.getAddress('0x8881f109551bd432803012645ac136ddd64dba72'),
+      [handle]: ADDR_B,
     };
     assert.deepEqual(res.clearValues, expectedRes);
   });
 
   it('Select works for eaddress returning if true', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addBool(true);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    input.addAddress('0x8881f109551bd432803012645ac136ddd64dba72');
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'bool', value: true }, { type: 'address', value: ADDR_A }, { type: 'address', value: ADDR_B }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
     const tx = await this.contract.test_select_eaddress(
       encryptedAmount.handles[0],
       encryptedAmount.handles[1],
@@ -121,7 +299,7 @@ describe('FHEVM manual operations', function () {
     const handle = await this.contract.resAdd();
     const res = await this.instance.publicDecrypt([handle]);
     const expectedRes = {
-      [handle]: ethers.getAddress('0x8ba1f109551bd432803012645ac136ddd64dba72'),
+      [handle]: ADDR_A,
     };
     assert.deepEqual(res.clearValues, expectedRes);
   });
@@ -265,10 +443,11 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress eq eaddress,eaddress true', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }, { type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
     const tx = await this.contract.test_eq_eaddress_eaddress(
       encryptedAmount.handles[0],
       encryptedAmount.handles[1],
@@ -284,10 +463,11 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress eq eaddress,eaddress false', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    input.addAddress('0x9ba1f109551bd432803012645ac136ddd64dba72');
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }, { type: 'address', value: ADDR_C }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
     const tx = await this.contract.test_eq_eaddress_eaddress(
       encryptedAmount.handles[0],
       encryptedAmount.handles[1],
@@ -303,10 +483,12 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress eq scalar eaddress,address true', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const b = '0x8ba1f109551bd432803012645ac136ddd64dba72';
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const b = ADDR_A;
     const tx = await this.contract.test_eq_eaddress_address(encryptedAmount.handles[0], b, encryptedAmount.inputProof);
     await tx.wait();
     const handle = await this.contract.resEbool();
@@ -318,10 +500,12 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress eq scalar eaddress,address false', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const b = '0x9aa1f109551bd432803012645ac136ddd64dba72';
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const b = ADDR_D;
     const tx = await this.contract.test_eq_eaddress_address(encryptedAmount.handles[0], b, encryptedAmount.inputProof);
     await tx.wait();
     const handle = await this.contract.resEbool();
@@ -333,10 +517,12 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress eq scalar address,eaddress true', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const b = '0x8ba1f109551bd432803012645ac136ddd64dba72';
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const b = ADDR_A;
     const tx = await this.contract.test_eq_address_eaddress(encryptedAmount.handles[0], b, encryptedAmount.inputProof);
     await tx.wait();
     const handle = await this.contract.resEbool();
@@ -348,10 +534,12 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress eq scalar address,eaddress false', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const b = '0x9aa1f109551bd432803012645ac136ddd64dba72';
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const b = ADDR_D;
     const tx = await this.contract.test_eq_address_eaddress(encryptedAmount.handles[0], b, encryptedAmount.inputProof);
     await tx.wait();
     const handle = await this.contract.resEbool();
@@ -363,10 +551,11 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress ne eaddress,eaddress false', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }, { type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
     const tx = await this.contract.test_ne_eaddress_eaddress(
       encryptedAmount.handles[0],
       encryptedAmount.handles[1],
@@ -382,10 +571,11 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress ne eaddress,eaddress true', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    input.addAddress('0x9ba1f109551bd432803012645ac136ddd64dba72');
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }, { type: 'address', value: ADDR_C }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
     const tx = await this.contract.test_ne_eaddress_eaddress(
       encryptedAmount.handles[0],
       encryptedAmount.handles[1],
@@ -401,10 +591,12 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress ne scalar eaddress,address false', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const b = '0x8ba1f109551bd432803012645ac136ddd64dba72';
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const b = ADDR_A;
     const tx = await this.contract.test_ne_eaddress_address(encryptedAmount.handles[0], b, encryptedAmount.inputProof);
     await tx.wait();
     const handle = await this.contract.resEbool();
@@ -416,10 +608,12 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress ne scalar eaddress,address true', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const b = '0x9aa1f109551bd432803012645ac136ddd64dba72';
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const b = ADDR_D;
     const tx = await this.contract.test_ne_eaddress_address(encryptedAmount.handles[0], b, encryptedAmount.inputProof);
     await tx.wait();
     const handle = await this.contract.resEbool();
@@ -431,10 +625,12 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress ne scalar address,eaddress false', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const b = '0x8ba1f109551bd432803012645ac136ddd64dba72';
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const b = ADDR_A;
     const tx = await this.contract.test_ne_address_eaddress(encryptedAmount.handles[0], b, encryptedAmount.inputProof);
     await tx.wait();
     const handle = await this.contract.resEbool();
@@ -446,10 +642,12 @@ describe('FHEVM manual operations', function () {
   });
 
   it('eaddress ne scalar address,eaddress true', async function () {
-    const input = this.instance.createEncryptedInput(this.contractAddress, this.signer.address);
-    input.addAddress('0x8ba1f109551bd432803012645ac136ddd64dba72');
-    const b = '0x9aa1f109551bd432803012645ac136ddd64dba72';
-    const encryptedAmount = await input.encrypt();
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: ADDR_A }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const b = ADDR_D;
     const tx = await this.contract.test_ne_address_eaddress(encryptedAmount.handles[0], b, encryptedAmount.inputProof);
     await tx.wait();
     const handle = await this.contract.resEbool();
@@ -935,5 +1133,592 @@ describe('FHEVM manual operations', function () {
       [handle4]: true,
     };
     assert.deepEqual(res.clearValues, expectedRes);
+  });
+
+  it('test operator "sum" euint16 - two elements', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint16', value: 1000n }, { type: 'uint16', value: 2000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_sum_euint16(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint16();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 3000n);
+  });
+
+  it('test operator "sum" euint32 - two elements', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint32', value: 100000n }, { type: 'uint32', value: 200000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_sum_euint32(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint32();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 300000n);
+  });
+
+  it('test operator "sum" euint8 - three elements', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 10n }, { type: 'uint8', value: 20n }, { type: 'uint8', value: 30n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_sum_euint8(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      encryptedAmount.handles[2],
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 60n);
+  });
+
+  it('test operator "sum" euint64 - two elements', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint64', value: 1000000n }, { type: 'uint64', value: 2000000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_sum_euint64(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint64();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 3000000n);
+  });
+
+  it('test operator "sum" euint128 - two elements', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint128', value: 100000000000000000000n }, { type: 'uint128', value: 200000000000000000000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_sum_euint128(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint128();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 300000000000000000000n);
+  });
+
+  it('test operator "sum" euint8 - duplicate handle counted twice', async function () {
+    const value = 7;
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: value }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_sum_euint8_duplicate(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], value * 2);
+  });
+
+  it('test operator "sum" euint8 - uninitialized element treated as 0', async function () {
+    const tx = await this.contract.test_sum_euint8_uninitialized();
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 5n);
+  });
+
+  it('test operator "sum" euint8 - empty array returns 0', async function () {
+    const tx = await this.contract.test_sum_euint8_empty();
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 0n);
+  });
+
+  it('test operator "sum" euint8 - single element returns fresh handle', async function () {
+    const value = 42;
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: value }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_sum_euint8_single(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    assert.notEqual(handle, encryptedAmount.handles[0]);
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], BigInt(value));
+  });
+
+  it('test operator "sum" euint8 - 100 elements at max array size', async function () {
+    const tx = await this.contract.test_sum_euint8_max_array();
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 100n);
+  });
+
+  it('test operator "isIn" euint8 - value found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 20n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint8_found(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint8 - value not found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 99n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint8_not_found(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], false);
+  });
+
+  it('test operator "isIn" euint16 - value found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint16', value: 1000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint16(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint32 - value found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint32', value: 100000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint32(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint64 - value found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint64', value: 1000000000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint64(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint128 - value found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint128', value: 10000000000000000000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint128(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint8 - uninitialized value treated as 0 (found)', async function () {
+    const tx = await this.contract.test_isIn_euint8_uninitialized();
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint8 - single element set, found', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 42n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint8_single_element(
+      encryptedAmount.handles[0],
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint8 - 100 elements at max array size', async function () {
+    const tx = await this.contract.test_isIn_euint8_max_array();
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint8 - empty set returns false', async function () {
+    const tx = await this.contract.test_isIn_euint8_empty_set();
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], false);
+  });
+
+  it('test operator "isIn" euint8 - zero-initialized set, enc(0) found', async function () {
+    const tx = await this.contract.test_isIn_euint8_zero_initialized_set();
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint8 - max type value (255) found in set', async function () {
+    const tx = await this.contract.test_isIn_euint8_max_value_found();
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint8 - single element set, not found', async function () {
+    const tx = await this.contract.test_isIn_euint8_single_element_not_found();
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], false);
+  });
+
+  it('test operator "isIn" eaddress - value found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: '0x2222222222222222222222222222222222222222' }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_eaddress_found(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" eaddress - value not found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'address', value: '0x4444444444444444444444444444444444444444' }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_eaddress_not_found(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], false);
+  });
+
+  it('test operator "isIn" euint256 - value found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint256', value: 42n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint256_found(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], true);
+  });
+
+  it('test operator "isIn" euint256 - value not found in set', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint256', value: 99n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_isIn_euint256_not_found(encryptedAmount.handles[0], encryptedAmount.inputProof);
+    await tx.wait();
+    const handle = await this.contract.resEbool();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], false);
+  });
+
+  // euint8: 200 * 200 / 200 = 200 (intermediate 40000 overflows uint8, widening required)
+  it('test operator "mulDiv" euint8 enc*enc: (200 * 200) / 200 = 200', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 200n }, { type: 'uint8', value: 200n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint8_enc_enc(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      200n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 200n);
+  });
+
+  it('test operator "mulDiv" euint8 enc*scalar: (50 * 3) / 5 = 30', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 50n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint8_enc_scalar(
+      encryptedAmount.handles[0],
+      3n,
+      5n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 30n);
+  });
+
+  // euint16: 60000 * 60000 / 60000 = 60000 (intermediate overflows uint16)
+  it('test operator "mulDiv" euint16 enc*enc: (60000 * 60000) / 60000 = 60000', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint16', value: 60000n }, { type: 'uint16', value: 60000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint16_enc_enc(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      60000n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint16();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 60000n);
+  });
+
+  it('test operator "mulDiv" euint16 enc*scalar: (1000 * 3) / 5 = 600', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint16', value: 1000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint16_enc_scalar(
+      encryptedAmount.handles[0],
+      3n,
+      5n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint16();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 600n);
+  });
+
+  it('test operator "mulDiv" euint32 enc*enc: (300000 * 300000) / 300000 = 300000', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint32', value: 300000n }, { type: 'uint32', value: 300000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint32_enc_enc(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      300000n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint32();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 300000n);
+  });
+
+  it('test operator "mulDiv" euint32 enc*scalar: (1000000 * 3) / 5 = 600000', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint32', value: 1000000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint32_enc_scalar(
+      encryptedAmount.handles[0],
+      3n,
+      5n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint32();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 600000n);
+  });
+
+  // euint64: 10^10 * 10^10 / 10^10 = 10^10 (intermediate 10^20 overflows uint64)
+  it('test operator "mulDiv" euint64 enc*enc: (10^10 * 10^10) / 10^10 = 10^10', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint64', value: 10000000000n }, { type: 'uint64', value: 10000000000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint64_enc_enc(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      10000000000n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint64();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 10000000000n);
+  });
+
+  it('test operator "mulDiv" euint64 enc*scalar: (10^9 * 3) / 5 = 6*10^8', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint64', value: 1000000000n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint64_enc_scalar(
+      encryptedAmount.handles[0],
+      3n,
+      5n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint64();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 600000000n);
+  });
+
+  // Edge cases
+  it('test operator "mulDiv" - division by zero reverts', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 100n }, { type: 'uint8', value: 100n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    // divisor = 0 -> FHEVMExecutor reverts with DivisionByZero()
+    const promise = this.contract.test_mulDiv_euint8_enc_enc(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      0n,
+      encryptedAmount.inputProof,
+    );
+    await expect(promise).to.be.reverted;
+  });
+
+  it('test operator "mulDiv" euint8 enc*enc: (0 * 100) / 50 = 0 (zero factor1)', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 0n }, { type: 'uint8', value: 100n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint8_enc_enc(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      50n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 0n);
+  });
+
+  it('test operator "mulDiv" euint8 enc*enc: (100 * 0) / 50 = 0 (zero factor2 encrypted)', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 100n }, { type: 'uint8', value: 0n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint8_enc_enc(
+      encryptedAmount.handles[0],
+      encryptedAmount.handles[1],
+      50n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 0n);
+  });
+
+  it('test operator "mulDiv" euint8 enc*scalar: (100 * 0) / 50 = 0 (zero factor2 scalar)', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 100n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint8_enc_scalar(
+      encryptedAmount.handles[0],
+      0n, // scalar b = 0
+      50n,
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 0n);
+  });
+
+  it('test operator "mulDiv" euint8 enc*scalar: (7 * 3) / 4 = 5 (truncating division)', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 7n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint8_enc_scalar(
+      encryptedAmount.handles[0],
+      3n,
+      4n, // 21 / 4 = 5 (truncated, not 5.25)
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 5n);
+  });
+
+  it('test operator "mulDiv" euint8 enc*scalar: (1 * 1) / 2 = 0 (truncation to zero)', async function () {
+    const encryptedAmount = await this.instance.encryptTypedValues({
+      values: [{ type: 'uint8', value: 1n }],
+      contractAddress: this.contractAddress,
+      userAddress: this.signer.address,
+    });
+    const tx = await this.contract.test_mulDiv_euint8_enc_scalar(
+      encryptedAmount.handles[0],
+      1n,
+      2n, // 1 / 2 = 0 (integer truncation)
+      encryptedAmount.inputProof,
+    );
+    await tx.wait();
+    const handle = await this.contract.resEuint8();
+    const res = await this.instance.publicDecrypt([handle]);
+    assert.equal(res.clearValues[handle], 0n);
   });
 });

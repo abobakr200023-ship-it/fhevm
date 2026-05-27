@@ -12,6 +12,7 @@ contract GatewayConfigMock {
     }
 
     event InitializeGatewayConfig(
+        uint256 indexed kmsContextId,
         ProtocolMetadata metadata,
         Thresholds thresholds,
         KmsNode[] kmsNodes,
@@ -19,7 +20,8 @@ contract GatewayConfigMock {
         Custodian[] custodians
     );
 
-    event UpdateKmsNodes(
+    event UpdateKmsContext(
+        uint256 indexed newContextId,
         KmsNode[] newKmsNodes,
         uint256 newMpcThreshold,
         uint256 newPublicDecryptionThreshold,
@@ -27,56 +29,72 @@ contract GatewayConfigMock {
         uint256 newKmsGenThreshold
     );
 
+    event DestroyKmsContext(uint256 indexed kmsContextId);
+
     event UpdateCoprocessors(Coprocessor[] newCoprocessors, uint256 newCoprocessorThreshold);
 
     event UpdateCustodians(Custodian[] newCustodians);
 
-    event UpdateMpcThreshold(uint256 newMpcThreshold);
+    event UpdateMpcThresholdForContext(uint256 indexed contextId, uint256 newMpcThreshold);
 
-    event UpdatePublicDecryptionThreshold(uint256 newPublicDecryptionThreshold);
+    event UpdatePublicDecryptionThresholdForContext(uint256 indexed contextId, uint256 newPublicDecryptionThreshold);
 
-    event UpdateUserDecryptionThreshold(uint256 newUserDecryptionThreshold);
+    event UpdateUserDecryptionThresholdForContext(uint256 indexed contextId, uint256 newUserDecryptionThreshold);
 
-    event UpdateKmsGenThreshold(uint256 newKmsGenThreshold);
+    event UpdateKmsGenThresholdForContext(uint256 indexed contextId, uint256 newKmsGenThreshold);
 
     event UpdateCoprocessorThreshold(uint256 newCoprocessorThreshold);
 
     event AddHostChain(HostChain hostChain);
+
+    event DisableHostChain(uint256 indexed chainId);
+
+    event EnableHostChain(uint256 indexed chainId);
+
+    event RemoveHostChain(uint256 indexed chainId);
 
     event PauseAllGatewayContracts();
 
     event UnpauseAllGatewayContracts();
 
     function initializeFromEmptyProxy(
+        uint256 initialKmsContextId,
         ProtocolMetadata calldata initialMetadata,
         Thresholds calldata initialThresholds,
         KmsNode[] calldata initialKmsNodes,
         Coprocessor[] calldata initialCoprocessors,
         Custodian[] calldata initialCustodians
     ) public {
+        uint256 kmsContextId;
         ProtocolMetadata memory metadata;
         Thresholds memory thresholds;
         KmsNode[] memory kmsNodes = new KmsNode[](1);
         Coprocessor[] memory coprocessors = new Coprocessor[](1);
         Custodian[] memory custodians = new Custodian[](1);
 
-        emit InitializeGatewayConfig(metadata, thresholds, kmsNodes, coprocessors, custodians);
+        emit InitializeGatewayConfig(kmsContextId, metadata, thresholds, kmsNodes, coprocessors, custodians);
     }
 
-    function updateKmsNodes(
+    function updateKmsContext(
+        uint256 newContextId,
         KmsNode[] calldata newKmsNodes,
         uint256 newMpcThreshold,
         uint256 newPublicDecryptionThreshold,
         uint256 newUserDecryptionThreshold,
         uint256 newKmsGenThreshold
     ) public {
-        emit UpdateKmsNodes(
+        emit UpdateKmsContext(
+            newContextId,
             newKmsNodes,
             newMpcThreshold,
             newPublicDecryptionThreshold,
             newUserDecryptionThreshold,
             newKmsGenThreshold
         );
+    }
+
+    function destroyKmsContext(uint256 kmsContextId) external {
+        emit DestroyKmsContext(kmsContextId);
     }
 
     function updateCoprocessors(Coprocessor[] calldata newCoprocessors, uint256 newCoprocessorThreshold) external {
@@ -87,20 +105,23 @@ contract GatewayConfigMock {
         emit UpdateCustodians(newCustodians);
     }
 
-    function updateMpcThreshold(uint256 newMpcThreshold) external {
-        emit UpdateMpcThreshold(newMpcThreshold);
+    function updateMpcThresholdForContext(uint256 contextId, uint256 newMpcThreshold) external {
+        emit UpdateMpcThresholdForContext(contextId, newMpcThreshold);
     }
 
-    function updatePublicDecryptionThreshold(uint256 newPublicDecryptionThreshold) external {
-        emit UpdatePublicDecryptionThreshold(newPublicDecryptionThreshold);
+    function updatePublicDecryptionThresholdForContext(
+        uint256 contextId,
+        uint256 newPublicDecryptionThreshold
+    ) external {
+        emit UpdatePublicDecryptionThresholdForContext(contextId, newPublicDecryptionThreshold);
     }
 
-    function updateUserDecryptionThreshold(uint256 newUserDecryptionThreshold) external {
-        emit UpdateUserDecryptionThreshold(newUserDecryptionThreshold);
+    function updateUserDecryptionThresholdForContext(uint256 contextId, uint256 newUserDecryptionThreshold) external {
+        emit UpdateUserDecryptionThresholdForContext(contextId, newUserDecryptionThreshold);
     }
 
-    function updateKmsGenThreshold(uint256 newKmsGenThreshold) external {
-        emit UpdateKmsGenThreshold(newKmsGenThreshold);
+    function updateKmsGenThresholdForContext(uint256 contextId, uint256 newKmsGenThreshold) external {
+        emit UpdateKmsGenThresholdForContext(contextId, newKmsGenThreshold);
     }
 
     function updateCoprocessorThreshold(uint256 newCoprocessorThreshold) external {
@@ -109,6 +130,18 @@ contract GatewayConfigMock {
 
     function addHostChain(HostChain calldata hostChain) external {
         emit AddHostChain(hostChain);
+    }
+
+    function disableHostChain(uint256 chainId) external {
+        emit DisableHostChain(chainId);
+    }
+
+    function enableHostChain(uint256 chainId) external {
+        emit EnableHostChain(chainId);
+    }
+
+    function removeHostChain(uint256 chainId) external {
+        emit RemoveHostChain(chainId);
     }
 
     function pauseAllGatewayContracts() external {

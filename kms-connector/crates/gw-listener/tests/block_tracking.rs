@@ -1,78 +1,29 @@
 mod common;
 
-use crate::common::{check_event_in_db, fetch_from_db, mock_event_on_gw, start_test_listener};
-use connector_utils::{tests::setup::TestInstanceBuilder, types::db::EventType};
+use crate::common::{mock_event_on_gw, poll_db_for_event, start_test_listener};
+use connector_utils::tests::{db::requests::TestEventType, setup::TestInstanceBuilder};
 use rstest::rstest;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 #[rstest]
+#[case::public_decryption(TestEventType::PublicDecryption)]
+#[case::user_decryption(TestEventType::UserDecryption)]
+#[case::user_decryption_v2(TestEventType::UserDecryptionV2)]
+#[case::prep_keygen(TestEventType::PrepKeygen)]
+#[case::keygen(TestEventType::Keygen)]
+#[case::crsgen(TestEventType::Crsgen)]
 #[timeout(Duration::from_secs(90))]
 #[tokio::test]
-async fn test_block_tracking_public_decryption() -> anyhow::Result<()> {
-    test_block_tracking(EventType::PublicDecryptionRequest).await
-}
-
-#[rstest]
-#[timeout(Duration::from_secs(90))]
-#[tokio::test]
-async fn test_block_tracking_user_decryption() -> anyhow::Result<()> {
-    test_block_tracking(EventType::UserDecryptionRequest).await
-}
-
-#[rstest]
-#[timeout(Duration::from_secs(90))]
-#[tokio::test]
-async fn test_block_tracking_prep_keygen() -> anyhow::Result<()> {
-    test_block_tracking(EventType::PrepKeygenRequest).await
-}
-
-#[rstest]
-#[timeout(Duration::from_secs(90))]
-#[tokio::test]
-async fn test_block_tracking_keygen() -> anyhow::Result<()> {
-    test_block_tracking(EventType::KeygenRequest).await
-}
-
-#[rstest]
-#[timeout(Duration::from_secs(90))]
-#[tokio::test]
-async fn test_block_tracking_crsgen() -> anyhow::Result<()> {
-    test_block_tracking(EventType::CrsgenRequest).await
-}
-
-#[rstest]
-#[timeout(Duration::from_secs(90))]
-#[tokio::test]
-#[ignore = "
-    As there is currently only one PRSS init ID allowed,
-    the test won't pass as there will be only one row in the DB instead of two
-"]
-async fn test_block_tracking_prss_init() -> anyhow::Result<()> {
-    test_block_tracking(EventType::PrssInit).await
-}
-
-#[rstest]
-#[timeout(Duration::from_secs(90))]
-#[tokio::test]
-async fn test_block_tracking_key_reshare_same_set() -> anyhow::Result<()> {
-    test_block_tracking(EventType::KeyReshareSameSet).await
-}
-
-async fn test_block_tracking(event_type: EventType) -> anyhow::Result<()> {
+async fn test_block_tracking(#[case] event_type: TestEventType) -> anyhow::Result<()> {
     let mut test_instance = TestInstanceBuilder::db_gw_setup().await?;
     let cancel_token = CancellationToken::new();
     let gw_listener_task =
         start_test_listener(&mut test_instance, cancel_token.clone(), None).await;
 
     let (expected_event, _) = mock_event_on_gw(&test_instance, event_type).await?;
-    test_instance
-        .wait_for_log("Event successfully stored in DB!")
-        .await;
-
-    let rows = fetch_from_db(test_instance.db(), event_type).await?;
-    check_event_in_db(&rows, expected_event)?;
+    poll_db_for_event(test_instance.db(), event_type, &expected_event).await?;
     info!("Event successfully stored! Stopping GatewayListener...");
     cancel_token.cancel();
     gw_listener_task?.await?;
@@ -87,12 +38,7 @@ async fn test_block_tracking(event_type: EventType) -> anyhow::Result<()> {
     let gw_listener_task =
         start_test_listener(&mut test_instance, cancel_token.clone(), None).await;
 
-    test_instance
-        .wait_for_log("Event successfully stored in DB!")
-        .await;
-
-    let rows = fetch_from_db(test_instance.db(), event_type).await?;
-    check_event_in_db(&rows, expected_event)?;
+    poll_db_for_event(test_instance.db(), event_type, &expected_event).await?;
     info!("Event successfully stored! Stopping GatewayListener...");
 
     cancel_token.cancel();

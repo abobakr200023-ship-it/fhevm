@@ -9,6 +9,7 @@ version.workspace = true
 [dependencies]
 connector-utils.workspace = true
 fhevm_gateway_bindings.workspace = true
+fhevm_host_bindings.workspace = true
 
 actix-web.workspace = true
 alloy.workspace = true
@@ -22,6 +23,7 @@ tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 alloy = { workspace = true, features = ["json-rpc"] }

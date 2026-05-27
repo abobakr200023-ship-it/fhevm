@@ -1,26 +1,28 @@
-use std::collections::HashMap;
-
 use crate::{
     core::{
         KmsResponsePublisher,
         config::Config,
         event_picker::{DbEventPicker, EventPicker},
         event_processor::{
-            DbEventProcessor, DecryptionProcessor, EventProcessor, KMSGenerationProcessor,
-            KmsClient, s3::S3Service,
+            DbContextManager, DbEventProcessor, DecryptionProcessor, EventProcessor,
+            KMSGenerationProcessor, KmsClient, s3::S3Service,
         },
         kms_response_publisher::DbKmsResponsePublisher,
     },
-    monitoring::health::{KmsHealthClient, State},
+    monitoring::{
+        health::{KmsHealthClient, State},
+        metrics::register_event_latency,
+    },
 };
 use alloy::transports::http::reqwest;
 use anyhow::anyhow;
 use connector_utils::{
     conn::{DefaultProvider, connect_to_db, connect_to_rpc_node},
     tasks::spawn_with_limit,
-    types::{GatewayEvent, KmsResponse},
+    types::{KmsResponse, ProtocolEvent},
 };
 use fhevm_host_bindings::acl::ACL;
+use std::collections::HashMap;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
@@ -39,8 +41,8 @@ pub struct KmsWorker<E, Proc> {
 
 impl<E, Proc> KmsWorker<E, Proc>
 where
-    E: EventPicker<Event = GatewayEvent>,
-    Proc: EventProcessor<Event = GatewayEvent> + Clone + Send + 'static,
+    E: EventPicker<Event = ProtocolEvent>,
+    Proc: EventProcessor<Event = ProtocolEvent> + Clone + Send + 'static,
 {
     /// Creates a new `KmsWorker<E, Proc>`.
     pub fn new(
@@ -75,7 +77,7 @@ where
     }
 
     /// Spawns a new task to process each event.
-    async fn spawn_event_processing_tasks(&self, events: Vec<GatewayEvent>) {
+    async fn spawn_event_processing_tasks(&self, events: Vec<ProtocolEvent>) {
         for event in events {
             let event_processor = self.event_processor.clone();
             let response_publisher = self.response_publisher.clone();
@@ -92,7 +94,7 @@ where
     async fn handle_event(
         mut event_processor: Proc,
         response_publisher: DbKmsResponsePublisher,
-        mut event: GatewayEvent,
+        mut event: ProtocolEvent,
     ) {
         let otlp_context = event.otlp_context.clone();
         tracing::Span::current().set_parent(otlp_context.extract());
@@ -105,11 +107,15 @@ where
         if let Err(e) = response_publisher.publish_response(response).await {
             response_publisher.mark_event_as_pending(event).await;
             error!("Failed to publish response: {e}");
+        } else {
+            register_event_latency(&event);
         }
     }
 }
 
-impl KmsWorker<DbEventPicker, DbEventProcessor<DefaultProvider, DefaultProvider>> {
+impl
+    KmsWorker<DbEventPicker, DbEventProcessor<DefaultProvider, DefaultProvider, DbContextManager>>
+{
     /// Creates a new `KmsWorker` instance from a valid `Config`.
     pub async fn from_config(config: Config) -> anyhow::Result<(Self, State<DefaultProvider>)> {
         let db_pool = connect_to_db(&config.database_url, config.database_pool_size).await?;
@@ -138,10 +144,16 @@ impl KmsWorker<DbEventPicker, DbEventProcessor<DefaultProvider, DefaultProvider>
 
         let event_picker = DbEventPicker::connect(db_pool.clone(), &config).await?;
 
+        let context_manager = DbContextManager::new(db_pool.clone());
         let s3_service = S3Service::new(&config, gateway_provider.clone(), s3_client);
-        let decryption_processor =
-            DecryptionProcessor::new(&config, gateway_provider.clone(), acl_contracts, s3_service);
-        let kms_generation_processor = KMSGenerationProcessor::new(&config);
+        let decryption_processor = DecryptionProcessor::new(
+            &config,
+            context_manager.clone(),
+            gateway_provider.clone(),
+            acl_contracts,
+            s3_service,
+        );
+        let kms_generation_processor = KMSGenerationProcessor::new(&config, context_manager);
         let event_processor = DbEventProcessor::new(
             kms_client.clone(),
             decryption_processor,

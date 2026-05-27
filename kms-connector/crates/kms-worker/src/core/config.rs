@@ -38,13 +38,16 @@ pub struct Config {
     pub gateway_url: Url,
     /// The Chain ID of the Gateway.
     pub gateway_chain_id: u64,
-    /// The `Decryption` contract configuration.
+    /// The `Decryption` contract configuration (on Gateway).
     #[serde(deserialize_with = "deserialize_decryption_contract_config")]
     pub decryption_contract: ContractConfig,
-    /// The `GatewayConfig` contract configuration.
+    /// The `GatewayConfig` contract configuration (on Gateway).
     #[serde(deserialize_with = "deserialize_gateway_config_contract_config")]
     pub gateway_config_contract: ContractConfig,
-    /// The `KMSGeneration` contract configuration.
+
+    /// The Chain ID of the Ethereum chain.
+    pub ethereum_chain_id: u64,
+    /// The `KMSGeneration` contract configuration (on Ethereum).
     #[serde(deserialize_with = "deserialize_kms_generation_contract_config")]
     pub kms_generation_contract: ContractConfig,
 
@@ -68,6 +71,11 @@ pub struct Config {
     /// Timeout to connect to a S3 bucket.
     #[serde(with = "humantime_serde", default = "default_s3_connect_timeout")]
     pub s3_connect_timeout: Duration,
+
+    /// Gas cap for the host-chain `IERC1271.isValidSignature` static call (RFC-012).
+    /// Bounded to prevent resource exhaustion from malicious smart-account contracts.
+    #[serde(default = "default_erc1271_gas_limit")]
+    pub erc1271_gas_limit: u64,
 
     /// The service name used for tracing.
     #[serde(default = "default_service_name")]
@@ -162,6 +170,10 @@ fn default_s3_connect_timeout() -> Duration {
     Duration::from_secs(3)
 }
 
+fn default_erc1271_gas_limit() -> u64 {
+    100_000
+}
+
 impl DeserializeConfig for Config {}
 
 // Default implementation for testing purpose
@@ -177,6 +189,7 @@ impl Default for Config {
             gateway_chain_id: 54321,
             decryption_contract: default_decryption_contract_config(),
             gateway_config_contract: default_gateway_config_contract_config(),
+            ethereum_chain_id: 11155111, // Sepolia
             kms_generation_contract: default_kms_generation_contract_config(),
             host_chains: vec![HostChainConfig {
                 url: Url::from_str("http://localhost:8545").unwrap(),
@@ -188,6 +201,7 @@ impl Default for Config {
             max_decryption_attempts: default_max_decryption_attempts(),
             s3_ciphertext_retrieval_retries: default_s3_ciphertext_retrieval_retries(),
             s3_connect_timeout: default_s3_connect_timeout(),
+            erc1271_gas_limit: default_erc1271_gas_limit(),
             service_name: default_service_name(),
             task_limit: default_task_limit(),
             monitoring_endpoint: default_monitoring_endpoint(),
@@ -209,6 +223,7 @@ mod tests {
             env::remove_var("KMS_CONNECTOR_EVENTS_BATCH_SIZE");
             env::remove_var("KMS_CONNECTOR_GATEWAY_URL");
             env::remove_var("KMS_CONNECTOR_GATEWAY_CHAIN_ID");
+            env::remove_var("KMS_CONNECTOR_ETHEREUM_CHAIN_ID");
             env::remove_var("KMS_CONNECTOR_DECRYPTION_CONTRACT__ADDRESS");
             env::remove_var("KMS_CONNECTOR_GATEWAY_CONFIG_CONTRACT__ADDRESS");
             env::remove_var("KMS_CONNECTOR_KMS_GENERATION_CONTRACT__ADDRESS");
@@ -245,6 +260,7 @@ mod tests {
             env::set_var("KMS_CONNECTOR_EVENTS_BATCH_SIZE", "15");
             env::set_var("KMS_CONNECTOR_GATEWAY_URL", "http://localhost:9545");
             env::set_var("KMS_CONNECTOR_GATEWAY_CHAIN_ID", "31888");
+            env::set_var("KMS_CONNECTOR_ETHEREUM_CHAIN_ID", "31444");
             env::set_var(
                 "KMS_CONNECTOR_DECRYPTION_CONTRACT__ADDRESS",
                 "0x5fbdb2315678afecb367f032d93f642f64180aa3",
@@ -290,6 +306,7 @@ mod tests {
             Url::from_str("http://localhost:9545").unwrap()
         );
         assert_eq!(config.gateway_chain_id, 31888);
+        assert_eq!(config.ethereum_chain_id, 31444);
         assert_eq!(
             config.decryption_contract.address,
             Address::from_str("0x5fbdb2315678afecb367f032d93f642f64180aa3").unwrap()

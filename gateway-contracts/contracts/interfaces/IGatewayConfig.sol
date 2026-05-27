@@ -37,6 +37,7 @@ interface IGatewayConfig {
 
     /**
      * @notice Emitted when the GatewayConfig initialization is completed.
+     * @param kmsContextId The KMS context ID.
      * @param metadata Metadata of the protocol.
      * @param thresholds The operator's thresholds.
      * @param kmsNodes List of KMS nodes.
@@ -44,6 +45,7 @@ interface IGatewayConfig {
      * @param custodians List of custodians.
      */
     event InitializeGatewayConfig(
+        uint256 indexed kmsContextId,
         ProtocolMetadata metadata,
         Thresholds thresholds,
         KmsNode[] kmsNodes,
@@ -52,20 +54,31 @@ interface IGatewayConfig {
     );
 
     /**
-     * @notice Emitted when the KMS nodes have been updated.
+     * @notice Emitted when the KMS context has been updated.
+     * @param newContextId The new context ID associated with the KMS nodes.
      * @param newKmsNodes The new KMS nodes.
      * @param newMpcThreshold The new MPC threshold.
      * @param newPublicDecryptionThreshold The new public decryption threshold.
      * @param newUserDecryptionThreshold The new user decryption threshold.
      * @param newKmsGenThreshold The new key and CRS generation threshold.
      */
-    event UpdateKmsNodes(
+    event UpdateKmsContext(
+        uint256 indexed newContextId,
         KmsNode[] newKmsNodes,
         uint256 newMpcThreshold,
         uint256 newPublicDecryptionThreshold,
         uint256 newUserDecryptionThreshold,
         uint256 newKmsGenThreshold
     );
+
+    /**
+     * @notice Emitted when a KMS context has been destroyed.
+     * @dev Once destroyed, a context's signers and tx senders are reported as not registered by
+     *      `isKmsSignerForContext` / `isKmsTxSenderForContext`, so on-chain verification rejects
+     *      signatures referencing the destroyed context.
+     * @param kmsContextId The destroyed KMS context ID.
+     */
+    event DestroyKmsContext(uint256 indexed kmsContextId);
 
     /**
      * @notice Emitted when the coprocessors have been updated.
@@ -81,28 +94,32 @@ interface IGatewayConfig {
     event UpdateCustodians(Custodian[] newCustodians);
 
     /**
-     * @notice Emitted when the MPC threshold has been updated.
+     * @notice Emitted when the MPC threshold for a specific KMS context has been updated.
+     * @param contextId The KMS context the threshold was updated for.
      * @param newMpcThreshold The new MPC threshold.
      */
-    event UpdateMpcThreshold(uint256 newMpcThreshold);
+    event UpdateMpcThresholdForContext(uint256 indexed contextId, uint256 newMpcThreshold);
 
     /**
-     * @notice Emitted when the public decryption threshold has been updated.
+     * @notice Emitted when the public decryption threshold for a specific KMS context has been updated.
+     * @param contextId The KMS context the threshold was updated for.
      * @param newPublicDecryptionThreshold The new public decryption threshold.
      */
-    event UpdatePublicDecryptionThreshold(uint256 newPublicDecryptionThreshold);
+    event UpdatePublicDecryptionThresholdForContext(uint256 indexed contextId, uint256 newPublicDecryptionThreshold);
 
     /**
-     * @notice Emitted when the user decryption threshold has been updated.
+     * @notice Emitted when the user decryption threshold for a specific KMS context has been updated.
+     * @param contextId The KMS context the threshold was updated for.
      * @param newUserDecryptionThreshold The new user decryption threshold.
      */
-    event UpdateUserDecryptionThreshold(uint256 newUserDecryptionThreshold);
+    event UpdateUserDecryptionThresholdForContext(uint256 indexed contextId, uint256 newUserDecryptionThreshold);
 
     /**
-     * @notice Emitted when the key and CRS generation threshold has been updated.
+     * @notice Emitted when the key and CRS generation threshold for a specific KMS context has been updated.
+     * @param contextId The KMS context the threshold was updated for.
      * @param newKmsGenThreshold The new key and CRS generation threshold.
      */
-    event UpdateKmsGenThreshold(uint256 newKmsGenThreshold);
+    event UpdateKmsGenThresholdForContext(uint256 indexed contextId, uint256 newKmsGenThreshold);
 
     /**
      * @notice Emitted when the coprocessor threshold has been updated.
@@ -115,6 +132,26 @@ interface IGatewayConfig {
      * @param hostChain The new host chain metadata.
      */
     event AddHostChain(HostChain hostChain);
+
+    /**
+     * @notice Emitted when a registered host chain has been disabled.
+     * @param chainId The disabled host chain's chain ID.
+     */
+    event DisableHostChain(uint256 indexed chainId);
+
+    /**
+     * @notice Emitted when a previously-disabled host chain has been re-enabled.
+     * @param chainId The re-enabled host chain's chain ID.
+     */
+    event EnableHostChain(uint256 indexed chainId);
+
+    /**
+     * @notice Emitted when a registered host chain has been removed from the registry.
+     * @dev Only possible after the chain has been disabled via `disableHostChain`. After removal,
+     *      the same `chainId` can be freshly registered again via `addHostChain`.
+     * @param chainId The removed host chain's chain ID.
+     */
+    event RemoveHostChain(uint256 indexed chainId);
 
     /**
      * @notice Error indicating that the given account is not a pauser.
@@ -245,6 +282,80 @@ interface IGatewayConfig {
     error HostChainAlreadyRegistered(uint256 chainId);
 
     /**
+     * @notice Error emitted when targeting a host chain that is not registered.
+     * @param chainId The host chain's chain ID.
+     */
+    error HostChainNotRegistered(uint256 chainId);
+
+    /**
+     * @notice Error emitted when trying to disable a host chain that is already disabled.
+     * @param chainId The host chain's chain ID.
+     */
+    error HostChainAlreadyDisabled(uint256 chainId);
+
+    /**
+     * @notice Error emitted when trying to enable a host chain that is not currently disabled.
+     * @param chainId The host chain's chain ID.
+     */
+    error HostChainAlreadyEnabled(uint256 chainId);
+
+    /**
+     * @notice Error emitted when trying to remove a host chain that has not been disabled first.
+     * @dev `removeHostChain` requires the chain to be disabled to force a deliberate two-step
+     *      action and to prevent yanking a chain out from under in-flight requests.
+     * @param chainId The host chain's chain ID.
+     */
+    error HostChainNotDisabled(uint256 chainId);
+
+    /**
+     * @notice Error indicating that a null KMS context ID is not allowed.
+     */
+    error InvalidNullKmsContextId();
+
+    /**
+     * @notice Error emitted when the KMS signer set exceeds the proof format limit (`uint8`
+     *         signature count in the `decryptionProof` payload consumed by `KMSVerifier`).
+     * @param signerCount The number of signers in the rejected set.
+     * @param maxAllowed The maximum size the proof format can carry.
+     */
+    error KmsSignerSetExceedsProofFormatLimit(uint256 signerCount, uint256 maxAllowed);
+
+    /**
+     * @notice Error emitted when a per-context threshold exceeds the proof format limit (`uint8`
+     *         signature count in the `decryptionProof` payload consumed by `KMSVerifier`).
+     * @param thresholdName The name of the invalid threshold.
+     * @param threshold The invalid threshold value.
+     * @param maxAllowed The maximum value the proof format can carry.
+     */
+    error ThresholdExceedsProofFormatLimit(string thresholdName, uint256 threshold, uint256 maxAllowed);
+
+    /**
+     * @notice Error emitted when an admin operation requires `InputVerification` to be paused first.
+     * @dev `updateCoprocessors` and `updateCoprocessorThreshold` rewrite consensus state read by
+     *      every input verification, so the contract must be paused first to drain in-flight requests.
+     */
+    error InputVerificationMustBePaused();
+
+    /**
+     * @notice Error emitted when the KMS context ID is not strictly greater than the current one.
+     * @param contextId The provided context ID.
+     * @param currentKmsContextId The current KMS context ID.
+     */
+    error KmsContextAlreadyRegistered(uint256 contextId, uint256 currentKmsContextId);
+
+    /**
+     * @notice Error emitted when an attempt is made to destroy the current KMS context.
+     * @param currentKmsContextId The current KMS context ID, which cannot be destroyed.
+     */
+    error CurrentKmsContextCannotBeDestroyed(uint256 currentKmsContextId);
+
+    /**
+     * @notice Error emitted when targeting a KMS context that does not exist or has already been destroyed.
+     * @param kmsContextId The invalid KMS context ID.
+     */
+    error InvalidKmsContext(uint256 kmsContextId);
+
+    /**
      * @notice Error indicating that a null chain ID is not allowed.
      */
     error InvalidNullChainId();
@@ -256,16 +367,28 @@ interface IGatewayConfig {
     error ChainIdNotUint64(uint256 chainId);
 
     /**
-     * @notice Update the list of KMS nodes and their thresholds.
+     * @notice Error emitted when all the pausable gateway contracts are already paused.
+     */
+    error AllGatewayContractsAlreadyPaused();
+
+    /**
+     * @notice Error emitted when all the pausable gateway contracts are already unpaused.
+     */
+    error AllGatewayContractsAlreadyUnpaused();
+
+    /**
+     * @notice Update the KMS context: nodes and thresholds for a given context ID.
      * @dev ⚠️ This function should be used with caution as it can lead to unexpected behavior in
      * some requests and the contracts should first be paused. It will be deprecated in the future.
+     * @param newContextId The new context ID to associate with the KMS nodes.
      * @param newKmsNodes The new KMS nodes.
      * @param newMpcThreshold The new MPC threshold.
      * @param newPublicDecryptionThreshold The new public decryption threshold.
      * @param newUserDecryptionThreshold The new user decryption threshold.
      * @param newKmsGenThreshold The new key and CRS generation threshold.
      */
-    function updateKmsNodes(
+    function updateKmsContext(
+        uint256 newContextId,
         KmsNode[] calldata newKmsNodes,
         uint256 newMpcThreshold,
         uint256 newPublicDecryptionThreshold,
@@ -274,9 +397,18 @@ interface IGatewayConfig {
     ) external;
 
     /**
+     * @notice Destroy a non-current KMS context, preventing it from being used for verification.
+     * @dev Once destroyed, the context's signers and tx senders are reported as not registered by
+     *      `isKmsSignerForContext` / `isKmsTxSenderForContext`, and `getKmsNodeForContext` returns
+     *      the zero `KmsNode`. The current context cannot be destroyed.
+     * @param kmsContextId The non-current KMS context to destroy.
+     */
+    function destroyKmsContext(uint256 kmsContextId) external;
+
+    /**
      * @notice Update the list of coprocessors and their threshold.
-     * @dev ⚠️ This function should be used with caution as it can lead to unexpected behavior in
-     * some requests and the contracts should first be paused. It will be deprecated in the future.
+     * @dev Requires `InputVerification` to be paused first — this call rewrites the coprocessor
+     *      set, which input verification reads on every call.
      * @param newCoprocessors The new coprocessors.
      * @param newCoprocessorThreshold The new coprocessor threshold.
      */
@@ -290,36 +422,53 @@ interface IGatewayConfig {
     function updateCustodians(Custodian[] calldata newCustodians) external;
 
     /**
-     * @notice Update the MPC threshold.
-     * @dev The new threshold must verify `0 <= t < n`, with `n` the number of KMS nodes currently registered.
+     * @notice Update the MPC threshold for a given KMS context.
+     * @dev The new threshold must verify `0 <= t < n`, with `n` the number of KMS nodes registered
+     *      for the given context. Updating the *current* KMS context's threshold can affect in-flight
+     *      decryption requests pinned to that context (they may fail to reach the new threshold or
+     *      reach it earlier than originally configured); the operator should ensure timing accordingly.
+     * @param contextId The KMS context to update.
      * @param newMpcThreshold The new MPC threshold.
      */
-    function updateMpcThreshold(uint256 newMpcThreshold) external;
+    function updateMpcThresholdForContext(uint256 contextId, uint256 newMpcThreshold) external;
 
     /**
-     * @notice Update the public decryption threshold.
-     * @dev The new threshold must verify `1 <= t <= n`, with `n` the number of KMS nodes currently registered.
+     * @notice Update the public decryption threshold for a given KMS context.
+     * @dev The new threshold must verify `1 <= t <= n`, with `n` the number of KMS nodes registered
+     *      for the given context. Updating the *current* KMS context's threshold can affect in-flight
+     *      decryption requests pinned to that context; the operator should ensure timing accordingly.
+     * @param contextId The KMS context to update.
      * @param newPublicDecryptionThreshold The new public decryption threshold.
      */
-    function updatePublicDecryptionThreshold(uint256 newPublicDecryptionThreshold) external;
+    function updatePublicDecryptionThresholdForContext(
+        uint256 contextId,
+        uint256 newPublicDecryptionThreshold
+    ) external;
 
     /**
-     * @notice Update the user decryption threshold.
-     * @dev The new threshold must verify `1 <= t <= n`, with `n` the number of KMS nodes currently registered.
+     * @notice Update the user decryption threshold for a given KMS context.
+     * @dev The new threshold must verify `1 <= t <= n`, with `n` the number of KMS nodes registered
+     *      for the given context. Updating the *current* KMS context's threshold can affect in-flight
+     *      decryption requests pinned to that context; the operator should ensure timing accordingly.
+     * @param contextId The KMS context to update.
      * @param newUserDecryptionThreshold The new user decryption threshold.
      */
-    function updateUserDecryptionThreshold(uint256 newUserDecryptionThreshold) external;
+    function updateUserDecryptionThresholdForContext(uint256 contextId, uint256 newUserDecryptionThreshold) external;
 
     /**
-     * @notice Update the key and CRS generation threshold.
-     * @dev The new threshold must verify `1 <= t <= n`, with `n` the number of KMS nodes currently registered.
+     * @notice Update the key and CRS generation threshold for a given KMS context.
+     * @dev The new threshold must verify `1 <= t <= n`, with `n` the number of KMS nodes registered
+     *      for the given context. Updating the *current* KMS context's threshold can affect in-flight
+     *      key/CRS generation requests pinned to that context; the operator should ensure timing accordingly.
+     * @param contextId The KMS context to update.
      * @param newKmsGenThreshold The new key and CRS generation threshold.
      */
-    function updateKmsGenThreshold(uint256 newKmsGenThreshold) external;
+    function updateKmsGenThresholdForContext(uint256 contextId, uint256 newKmsGenThreshold) external;
 
     /**
      * @notice Update the coprocessor threshold.
      * @dev The new threshold must verify `1 <= t <= n`, with `n` the number of coprocessors currently registered.
+     *      Requires `InputVerification` to be paused first — input verification reads this threshold on every call.
      * @param newCoprocessorThreshold The new coprocessor threshold.
      */
     function updateCoprocessorThreshold(uint256 newCoprocessorThreshold) external;
@@ -330,6 +479,26 @@ interface IGatewayConfig {
      * @param hostChain The new host chain metadata to include.
      */
     function addHostChain(HostChain calldata hostChain) external;
+
+    /**
+     * @notice Disable a registered host chain.
+     * @param chainId The host chain to disable.
+     */
+    function disableHostChain(uint256 chainId) external;
+
+    /**
+     * @notice Re-enable a previously-disabled host chain.
+     * @param chainId The host chain to enable.
+     */
+    function enableHostChain(uint256 chainId) external;
+
+    /**
+     * @notice Remove a registered host chain from the registry.
+     * @dev The chain must be disabled first via `disableHostChain`. After removal, the same
+     *      `chainId` can be freshly registered again via `addHostChain`.
+     * @param chainId The host chain to remove.
+     */
+    function removeHostChain(uint256 chainId) external;
 
     /**
      * @notice Pause all pausable gateway contracts.
@@ -384,6 +553,14 @@ interface IGatewayConfig {
     function isHostChainRegistered(uint256 chainId) external view returns (bool);
 
     /**
+     * @notice Indicates if a registered host chain has been disabled by the gateway owner.
+     * @dev Returns false for both unknown and registered-but-enabled chains; check
+     *      `isHostChainRegistered` first to distinguish them.
+     * @param chainId The chain ID to check.
+     */
+    function isHostChainDisabled(uint256 chainId) external view returns (bool);
+
+    /**
      * @notice Check if the account is a pauser.
      * @return Whether or not the account is a pauser.
      */
@@ -400,18 +577,6 @@ interface IGatewayConfig {
      *  @return The MPC threshold.
      */
     function getMpcThreshold() external view returns (uint256);
-
-    /**
-     * @notice Get the public decryption threshold.
-     * @return The public decryption threshold.
-     */
-    function getPublicDecryptionThreshold() external view returns (uint256);
-
-    /**
-     * @notice Get the user decryption threshold.
-     * @return The user decryption threshold.
-     */
-    function getUserDecryptionThreshold() external view returns (uint256);
 
     /**
      * @notice Get the key and CRS generation threshold
@@ -490,6 +655,73 @@ interface IGatewayConfig {
      * @return The list of custodians' signer addresses.
      */
     function getCustodianSigners() external view returns (address[] memory);
+
+    /**
+     * @notice Indicates if an address is a registered KMS transaction sender for a given context.
+     * @param contextId The context ID to check.
+     * @param txSenderAddress The address to check.
+     */
+    function isKmsTxSenderForContext(uint256 contextId, address txSenderAddress) external view returns (bool);
+
+    /**
+     * @notice Indicates if an address is a registered KMS signer for a given context.
+     * @param contextId The context ID to check.
+     * @param signerAddress The address to check.
+     */
+    function isKmsSignerForContext(uint256 contextId, address signerAddress) external view returns (bool);
+
+    /**
+     * @notice Get the metadata of the KMS node with the given transaction sender address for a given context.
+     * @param contextId The context ID.
+     * @param kmsTxSenderAddress The KMS transaction sender address.
+     * @return The KMS node's metadata.
+     */
+    function getKmsNodeForContext(uint256 contextId, address kmsTxSenderAddress) external view returns (KmsNode memory);
+
+    /**
+     * @notice Get the list of all KMS nodes' transaction sender addresses for a given context.
+     * @param contextId The context ID.
+     * @return The list of KMS nodes' transaction sender addresses.
+     */
+    function getKmsTxSendersForContext(uint256 contextId) external view returns (address[] memory);
+
+    /**
+     * @notice Get the list of all KMS nodes' signer addresses for a given context.
+     * @param contextId The context ID.
+     * @return The list of KMS nodes' signer addresses.
+     */
+    function getKmsSignersForContext(uint256 contextId) external view returns (address[] memory);
+
+    /**
+     * @notice Get the current KMS context ID.
+     * @return The current KMS context ID.
+     */
+    function getCurrentKmsContextId() external view returns (uint256);
+
+    /**
+     * @notice Returns whether a KMS context ID has been created and not destroyed.
+     * @dev Non-reverting predicate intended for off-chain consumers. The per-context state
+     *      views (e.g. `isKmsSignerForContext`, `getKmsNodeForContext`) revert with
+     *      `InvalidKmsContext` for unknown/destroyed contexts; use this function to test
+     *      validity without exception handling.
+     * @param contextId The KMS context ID to check.
+     * @return True if the context exists and has not been destroyed.
+     */
+    function isValidKmsContext(uint256 contextId) external view returns (bool);
+
+    /**
+     * @notice Get the public decryption threshold for a given context.
+     * @param contextId The context ID.
+     * @return The public decryption threshold.
+     */
+    function getPublicDecryptionThresholdForContext(uint256 contextId) external view returns (uint256);
+
+    /**
+     * @notice Get the user decryption threshold for a given context.
+     * @param contextId The context ID.
+     * @return The user decryption threshold.
+     */
+    function getUserDecryptionThresholdForContext(uint256 contextId) external view returns (uint256);
 
     /**
      * @notice Returns the versions of the GatewayConfig contract in SemVer format.

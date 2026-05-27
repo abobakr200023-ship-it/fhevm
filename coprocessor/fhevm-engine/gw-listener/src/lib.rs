@@ -1,42 +1,15 @@
-use alloy::primitives::Uint;
+use alloy::primitives::Address;
 use alloy::transports::http::reqwest::Url;
 use fhevm_engine_common::utils::DatabaseURL;
 use std::time::Duration;
 
-use tracing::error;
-
-pub mod aws_s3;
-pub(crate) mod database;
-pub(crate) mod digest;
+pub(crate) mod drift_detector;
 pub mod gw_listener;
 pub mod http_server;
 pub(crate) mod metrics;
-pub(crate) mod sks_key;
-
-pub(crate) type ChainId = u64;
-pub(crate) type KeyId = Uint<256, 4>;
-pub(crate) type TenantId = u64;
-
-#[derive(Clone, Copy, Debug)]
-pub enum KeyType {
-    ServerKey = 0,
-    PublicKey = 1,
-}
-
-impl TryFrom<u8> for KeyType {
-    type Error = anyhow::Error;
-    fn try_from(value: u8) -> anyhow::Result<KeyType> {
-        match value {
-            0 => Ok(KeyType::ServerKey),
-            1 => Ok(KeyType::PublicKey),
-            _ => Err(anyhow::anyhow!("Invalid KeyType")),
-        }
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct ConfigSettings {
-    pub host_chain_id: ChainId,
     pub database_url: DatabaseURL,
     pub database_pool_size: u32,
     pub verify_proof_req_db_channel: String,
@@ -52,24 +25,27 @@ pub struct ConfigSettings {
 
     pub get_logs_poll_interval: Duration,
     pub get_logs_block_batch_size: u64,
-    pub replay_from_block: Option<i64>,
 
     pub log_last_processed_every_number_of_updates: u64,
-}
 
-pub fn chain_id_from_env() -> Option<ChainId> {
-    let chain_id_str = std::env::var("CHAIN_ID").ok()?;
-    let Ok(chain_id) = chain_id_str.parse::<u64>() else {
-        error!("CHAIN_ID environment variable is not a valid u64");
-        return None;
-    };
-    Some(chain_id)
+    pub ciphertext_commits_address: Option<Address>,
+    pub gateway_config_address: Option<Address>,
+    pub drift_no_consensus_timeout: Duration,
+    pub drift_post_consensus_grace: Duration,
+    /// How long to wait after detecting a pending drift-revert signal before
+    /// running the revert SQL. Gives other services time to see the signal
+    /// and re-exec (or fail-fast and be restarted by the supervisor) before
+    /// the DB state changes.
+    pub drift_auto_revert_grace_period: Duration,
+    /// If true, the drift detector creates drift-revert signals when it sees
+    /// a consensus mismatch. If false, drift is still detected and logged,
+    /// but no signal is created.
+    pub drift_auto_revert_enabled: bool,
 }
 
 impl Default for ConfigSettings {
     fn default() -> Self {
         Self {
-            host_chain_id: chain_id_from_env().unwrap_or(12345),
             database_url: DatabaseURL::default(),
             database_pool_size: 16,
             verify_proof_req_db_channel: "event_zkpok_new_work".to_owned(),
@@ -80,8 +56,13 @@ impl Default for ConfigSettings {
             health_check_timeout: Duration::from_secs(4),
             get_logs_poll_interval: Duration::from_millis(500),
             get_logs_block_batch_size: 100,
-            replay_from_block: None,
             log_last_processed_every_number_of_updates: 50,
+            ciphertext_commits_address: None,
+            gateway_config_address: None,
+            drift_no_consensus_timeout: Duration::from_secs(5),
+            drift_post_consensus_grace: Duration::from_secs(2),
+            drift_auto_revert_grace_period: Duration::from_secs(120),
+            drift_auto_revert_enabled: false,
         }
     }
 }

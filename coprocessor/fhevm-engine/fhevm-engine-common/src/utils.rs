@@ -115,6 +115,17 @@ impl HeartBeat {
         let elapsed = self.now_timestamp() - self.timestamp.load(Ordering::Relaxed);
         elapsed <= freshness.as_secs()
     }
+
+    pub fn with_elapsed_secs(elapsed_secs: u64) -> Self {
+        let now = std::time::Instant::now();
+        let timestamp_origin = now
+            .checked_sub(Duration::from_secs(elapsed_secs))
+            .unwrap_or(now);
+        Self {
+            timestamp_origin,
+            timestamp: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 impl Default for HeartBeat {
@@ -129,16 +140,14 @@ pub struct DatabaseURL(String);
 
 impl From<&str> for DatabaseURL {
     fn from(s: &str) -> Self {
-        let url = s.to_owned();
         let app_name = Self::default_app_name();
-        Self::new_with_app_name(&url, &app_name)
+        Self::new_with_app_name(s, &app_name)
     }
 }
 impl From<String> for DatabaseURL {
     fn from(s: String) -> Self {
-        let url = s.to_owned();
         let app_name = Self::default_app_name();
-        Self::new_with_app_name(&url, &app_name)
+        Self::new_with_app_name(&s, &app_name)
     }
 }
 

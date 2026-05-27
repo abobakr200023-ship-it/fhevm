@@ -211,24 +211,163 @@ contract FHEVMManualTestSuite {
         resEbool = FHE.xor(FHE.asEbool(a), b);
     }
 
-    function test_ebool_select_unitialized() public {
+    function test_ebool_select_uninitialized() public {
         ebool a_;
         ebool b_;
         ebool c_;
         resEbool = FHE.select(a_, b_, c_);
     }
 
-    function test_ebaddress_select_unitialized() public {
+    function test_ebaddress_select_uninitialized() public {
         ebool a_;
         eaddress b_;
         eaddress c_;
         resAdd = FHE.select(a_, b_, c_);
     }
 
-    function test_euint64_select_unitialized() public {
+    function test_euint64_select_uninitialized() public {
         ebool a_;
         euint64 b_;
         euint64 c_;
         resEuint64 = FHE.select(a_, b_, c_);
+    }
+
+    function test_isIn_euint8_found(externalEuint8 a, bytes calldata inputProof) public {
+        euint8 value = FHE.fromExternal(a, inputProof);
+        euint8[] memory set = new euint8[](3);
+        set[0] = FHE.asEuint8(1);
+        set[1] = FHE.asEuint8(42);
+        set[2] = FHE.asEuint8(100);
+        ebool result = FHE.isIn(value, set);
+        FHE.allowThis(result);
+        resEbool = result;
+    }
+
+    function test_isIn_euint8_not_found(externalEuint8 a, bytes calldata inputProof) public {
+        euint8 value = FHE.fromExternal(a, inputProof);
+        euint8[] memory set = new euint8[](2);
+        set[0] = FHE.asEuint8(1);
+        set[1] = FHE.asEuint8(2);
+        ebool result = FHE.isIn(value, set);
+        FHE.allowThis(result);
+        resEbool = result;
+    }
+
+    function test_isIn_euint8_uninitialized() public {
+        euint8 uninit_;
+        euint8[] memory set = new euint8[](2);
+        set[0] = FHE.asEuint8(0);
+        set[1] = FHE.asEuint8(1);
+        ebool result = FHE.isIn(uninit_, set);
+        FHE.allowThis(result);
+        resEbool = result;
+    }
+
+    function test_sum_euint8_uninitialized() public {
+        euint8 uninit_;
+        euint8[] memory values = new euint8[](2);
+        values[0] = FHE.asEuint8(5);
+        values[1] = uninit_;
+        euint8 result = FHE.sum(values);
+        FHE.allowThis(result);
+        resEuint8 = result;
+    }
+
+    function test_sum_euint8_empty() public {
+        euint8[] memory values = new euint8[](0);
+        euint8 result = FHE.sum(values);
+        FHE.allowThis(result);
+        resEuint8 = result;
+    }
+
+    function test_sum_euint8_single(externalEuint8 a, bytes calldata inputProof) public {
+        euint8[] memory values = new euint8[](1);
+        values[0] = FHE.fromExternal(a, inputProof);
+        euint8 result = FHE.sum(values);
+        FHE.allowThis(result);
+        resEuint8 = result;
+    }
+
+    function test_mulDiv_euint8_enc_enc(
+        externalEuint8 a,
+        externalEuint8 b,
+        uint8 divisor,
+        bytes calldata inputProof
+    ) public {
+        euint8 result = FHE.mulDiv(FHE.fromExternal(a, inputProof), FHE.fromExternal(b, inputProof), divisor);
+        FHE.allowThis(result);
+        resEuint8 = result;
+    }
+
+    function test_mulDiv_euint8_enc_scalar(externalEuint8 a, uint8 b, uint8 divisor, bytes calldata inputProof) public {
+        euint8 result = FHE.mulDiv(FHE.fromExternal(a, inputProof), b, divisor);
+        FHE.allowThis(result);
+        resEuint8 = result;
+    }
+
+    function test_mulDiv_euint16_enc_enc(
+        externalEuint16 a,
+        externalEuint16 b,
+        uint16 divisor,
+        bytes calldata inputProof
+    ) public {
+        euint16 result = FHE.mulDiv(FHE.fromExternal(a, inputProof), FHE.fromExternal(b, inputProof), divisor);
+        FHE.allowThis(result);
+        resEuint16 = result;
+    }
+
+    function test_mulDiv_euint16_enc_scalar(
+        externalEuint16 a,
+        uint16 b,
+        uint16 divisor,
+        bytes calldata inputProof
+    ) public {
+        euint16 result = FHE.mulDiv(FHE.fromExternal(a, inputProof), b, divisor);
+        FHE.allowThis(result);
+        resEuint16 = result;
+    }
+
+    function test_mulDiv_euint32_enc_enc(
+        externalEuint32 a,
+        externalEuint32 b,
+        uint32 divisor,
+        bytes calldata inputProof
+    ) public {
+        euint32 result = FHE.mulDiv(FHE.fromExternal(a, inputProof), FHE.fromExternal(b, inputProof), divisor);
+        FHE.allowThis(result);
+        resEuint32 = result;
+    }
+
+    function test_mulDiv_euint32_enc_scalar(
+        externalEuint32 a,
+        uint32 b,
+        uint32 divisor,
+        bytes calldata inputProof
+    ) public {
+        euint32 result = FHE.mulDiv(FHE.fromExternal(a, inputProof), b, divisor);
+        FHE.allowThis(result);
+        resEuint32 = result;
+    }
+
+    function test_mulDiv_euint64_enc_enc(
+        externalEuint64 a,
+        externalEuint64 b,
+        uint64 divisor,
+        bytes calldata inputProof
+    ) public {
+        euint64 result = FHE.mulDiv(FHE.fromExternal(a, inputProof), FHE.fromExternal(b, inputProof), divisor);
+        FHE.allowThis(result);
+        resEuint64 = result;
+    }
+
+    function test_mulDiv_euint64_enc_scalar(
+        externalEuint64 a,
+        uint64 b,
+        uint64 divisor,
+        bytes calldata inputProof
+    ) public {
+        euint64 result = FHE.mulDiv(FHE.fromExternal(a, inputProof), b, divisor);
+        FHE.allowThis(result);
+        resEuint64 = result;
     }
 }

@@ -4,36 +4,43 @@ use alloy::{
 };
 use connector_utils::tests::rand::rand_address;
 use fhevm_gateway_bindings::decryption::Decryption::{
-    CtHandleContractPair, userDecryptionRequestCall,
+    CtHandleContractPair, userDecryptionRequest_1Call as userDecryptionRequestCall,
 };
 use fhevm_host_bindings::acl::ACL::ACLInstance;
 use kms_worker::core::{
     Config, DbEventPicker, DbKmsResponsePublisher, KmsWorker,
     event_processor::{
-        DbEventProcessor, DecryptionProcessor, KMSGenerationProcessor, KmsClient, s3::S3Service,
+        DbContextManager, DbEventProcessor, DecryptionProcessor, KMSGenerationProcessor, KmsClient,
+        s3::S3Service,
     },
 };
 use sqlx::{Pool, Postgres};
 use std::collections::HashMap;
 
-pub async fn init_kms_worker<GP: Provider + Clone + 'static, HP: Provider + Clone + 'static>(
+pub async fn init_kms_worker<GP, HP>(
     config: Config,
     gateway_provider: GP,
     acl_contracts_mock: HashMap<u64, ACLInstance<HP>>,
     db: &Pool<Postgres>,
-) -> anyhow::Result<KmsWorker<DbEventPicker, DbEventProcessor<GP, HP>>> {
+) -> anyhow::Result<KmsWorker<DbEventPicker, DbEventProcessor<GP, HP, DbContextManager>>>
+where
+    GP: Provider + Clone + 'static,
+    HP: Provider + Clone + 'static,
+{
     let kms_client = KmsClient::connect(&config).await?;
     let s3_client = reqwest::Client::new();
     let event_picker = DbEventPicker::connect(db.clone(), &config).await?;
 
+    let context_manager = DbContextManager::new(db.clone());
     let s3_service = S3Service::new(&config, gateway_provider.clone(), s3_client);
     let decryption_processor = DecryptionProcessor::new(
         &config,
+        context_manager.clone(),
         gateway_provider.clone(),
         acl_contracts_mock,
         s3_service,
     );
-    let kms_generation_processor = KMSGenerationProcessor::new(&config);
+    let kms_generation_processor = KMSGenerationProcessor::new(&config, context_manager);
     let event_processor = DbEventProcessor::new(
         kms_client.clone(),
         decryption_processor,

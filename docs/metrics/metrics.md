@@ -33,24 +33,6 @@ Note that recommendations assume a smoke test that runs transactions/requests at
  - **Description**: Counts the number of failed add ciphertext material transactions in the transaction-sender.
  - **Alarm**: If the counter increases over a period of time.
     - **Recommendation**: more than 60 failures in 1 minute, i.e. `increase(counter[1m]) > 60`.
- 
-#### Metric Name: `coprocessor_txn_sender_allow_handle_success_counter`
- - **Type**: Counter
- - **Description**: Counts the number of successful allow handle transactions in the transaction-sender.
- - **Alarm**: If the counter is a flat line over a period of time.
-    - **Recommendation**: 0 for more than 1 minute, i.e. `increase(counter[1m]) == 0`.
-
-#### Metric Name: `coprocessor_txn_sender_allow_handle_fail_counter`
- - **Type**: Counter
- - **Description**: Counts the number of failed allow handle transactions in the transaction-sender.
- - **Alarm**: If the counter increases over a period of time.
-    - **Recommendation**: more than 60 failures in 1 minute, i.e. `increase(counter[1m]) > 60`.
-
-#### Metric Name: `coprocessor_allow_handle_unsent_gauge`
- - **Type**: Gauge
- - **Description**: Tracks the number of unsent allow handle transactions in the transaction-sender.
- - **Alarm**: If the gauge value exceeds a predefined threshold.
-    - **Recommendation**: more than 100 unsent over 2 minutes, i.e. `min_over_time(gauge[2m]) > 100`.
 
 #### Metric Name: `coprocessor_add_ciphertext_material_unsent_gauge`
  - **Type**: Gauge
@@ -101,39 +83,47 @@ Note that recommendations assume a smoke test that runs transactions/requests at
  - **Alarm**: If the counter increases over a period of time.
     - **Recommendation**: 0 for more than 1 minute, i.e. `increase(counter[1m]) == 0`.
 
-#### Metric Name: `coprocessor_gw_listener_activate_crs_success_counter`
+#### Metric Name: `coprocessor_gw_listener_drift_detected_counter`
  - **Type**: Counter
- - **Description**: Counts the number of successful activate CRS requests in GW listener.
- - **Alarm**: N/A - no alarm needed as activate CRS is an infrequent event.
+ - **Description**: Number of handles where coprocessor digests diverged. Does not discriminate whether divergence comes from the local coprocessor or another coprocessor in the network.
 
-#### Metric Name: `coprocessor_gw_listener_activate_crs_fail_counter`
+#### Metric Name: `coprocessor_gw_listener_consensus_timeout_counter`
  - **Type**: Counter
- - **Description**: Counts the number of failed activate CRS requests in GW listener.
- - **Alarm**: If the counter increases from 0. Activate CRS is an important event that should not fail.
-    - **Recommendation**: alarm on any failures over a 1 minute period, i.e. `increase(counter[1m]) > 0`.
+ - **Description**: Number of handles that timed out without a consensus event. This includes both handles where no consensus was ever observed and handles where all expected coprocessors submitted but the gateway never emitted a consensus event.
 
-#### Metric Name: `coprocessor_gw_listener_crs_digest_mismatch_counter`
+#### Metric Name: `coprocessor_gw_listener_missing_submission_counter`
  - **Type**: Counter
- - **Description**: Counts the number of CRS digest mismatches in GW listener.
- - **Alarm**: If the counter increases from 0. CRS digest mismatch is not something that is supposed to happen in normal circumstances.
-    - **Recommendation**: alarm on any failures over a 1 minute period, i.e. `increase(counter[1m]) > 0`.
+ - **Description**: Number of handles where consensus was reached but some expected coprocessors never submitted their ciphertext material before the post-consensus grace period expired.
 
-#### Metric Name: `coprocessor_gw_listener_activate_key_success_counter`
- - **Type**: Counter
- - **Description**: Counts the number of successful activate key requests in GW listener.
- - **Alarm**: N/A - no alarm needed as activate key is an infrequent event.
+#### Metric Name: `coprocessor_gw_listener_consensus_latency_blocks`
+ - **Type**: Histogram
+ - **Description**: Block distance between the first observed submission and the consensus event for a handle. Diagnostic metric for understanding on-chain latency; timeouts are wall-clock based and configured via `--drift-no-consensus-timeout`. Bucket boundaries: 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144.
 
-#### Metric Name: `coprocessor_gw_listener_activate_key_fail_counter`
- - **Type**: Counter
- - **Description**: Counts the number of failed activate key requests in GW listener.
- - **Alarm**: If the counter increases from 0. Activate key is an important event that should not fail.
-    - **Recommendation**: alarm on any failures over a 1 minute period, i.e. `increase(counter[1m]) > 0`.
+#### Metric Name: `coprocessor_gw_listener_post_consensus_completion_blocks`
+ - **Type**: Histogram
+ - **Description**: Block distance between the consensus event and seeing all expected submissions for a handle. Diagnostic metric for understanding on-chain completion latency; the grace window is wall-clock based and configured via `--drift-post-consensus-grace`. Bucket boundaries: 0, 1, 2, 3, 5, 8, 13, 21, 34.
 
-#### Metric Name: `coprocessor_gw_listener_key_digest_mismatch_counter`
- - **Type**: Counter
- - **Description**: Counts the number of key digest mismatches in GW listener.
- - **Alarm**: If the counter increases from 0. Key digest mismatch is not something that is supposed to happen in normal circumstances.
-    - **Recommendation**: alarm on any failures over a 1 minute period, i.e. `increase(counter[1m]) > 0`.
+#### Metric Name: `coprocessor_drift_revert_signal_created_counter`
+ - **Type**: Counter (labeled by `host_chain_id`)
+ - **Description**: Number of drift-revert signals created, per host chain. Each signal represents one detected consensus drift that triggered the auto-recovery mechanism. Emitted by gw-listener only.
+ - **Alarm**: Any non-zero increase is unusual — drift should be rare.
+    - **Recommendation**: alarm on `increase(counter[5m]) > 0`.
+
+#### Metric Name: `coprocessor_drift_revert_success_counter`
+ - **Type**: Counter (labeled by `host_chain_id`)
+ - **Description**: Number of drift reverts that completed successfully per host chain (SQL ran to completion and signal marked Done). Emitted by gw-listener only.
+
+#### Metric Name: `coprocessor_drift_revert_failure_counter`
+ - **Type**: Counter (labeled by `host_chain_id`)
+ - **Description**: Number of drift reverts that failed during SQL execution per host chain (signal marked Failed). Recovery did not complete and operator intervention may be required. Emitted by gw-listener only.
+ - **Alarm**: Any non-zero increase.
+    - **Recommendation**: alarm on `increase(counter[1m]) > 0`.
+
+#### Metric Name: `coprocessor_drift_revert_too_many_attempts_counter`
+ - **Type**: Counter (labeled by `host_chain_id`)
+ - **Description**: Number of times the revert runner refused to revert because too many successful reverts already happened in the recent window for this host chain. Indicates a deterministic loop where reverts succeed but drift keeps recurring (e.g. a tfhe-worker bug). The signal is marked Failed and the service refuses to start until an operator intervenes. Emitted by gw-listener only.
+ - **Alarm**: Any non-zero increase.
+    - **Recommendation**: alarm on `increase(counter[1m]) > 0`.
 
 ### zkproof-worker
 
@@ -220,11 +210,11 @@ Metrics for zkproof-worker are to be added in future releases, if/when needed. C
  - **Alarm**: If the counter is a flat line over a period of time, only for `event_type` `public_decryption_request` and `user_decryption_request`.
    - **Recommendation**: 0 for more than 1 minute, i.e. `increase(counter{event_type="..."}[1m]) == 0`.
 
-#### Metric Name: `kms_connector_gw_listener_event_received_errors`
+#### Metric Name: `kms_connector_gw_listener_event_listening_errors`
  - **Type**: Counter
  - **Labels**:
-   - `event_type`: see [description](#metric-name-kms_connector_gw_listener_event_received_counter)
- - **Description**: Counts the number of errors encountered by the GW listener while receiving events.
+   - `contract`: can be used to filter by contract (decryption, kmsgeneration).
+ - **Description**: Counts the number of errors encountered by the GW listener while listening for events.
  - **Alarm**: If the counter increases over a period of time.
    - **Recommendation**: more than 60 failures in 1 minute, i.e. `sum(increase(counter[1m])) > 60`.
 
@@ -290,6 +280,13 @@ Metrics for zkproof-worker are to be added in future releases, if/when needed. C
  - **Alarm**: If the counter increases over a period of time.
    - **Recommendation**: more than 60 failures in 1 minute, i.e. `sum(increase(counter[1m])) > 60`.
 
+#### Metric Name: `kms_connector_worker_decryption_latency_seconds`
+ - **Type**: Histogram
+ - **Labels**:
+   - `event_type`: see [description](#metric-name-kms_connector_gw_listener_event_received_counter)
+ - **Description**: Measures the latency of decryptions at the KMS worker level, from event creation to processing. Only applies to `public_decryption_request` and `user_decryption_request` event types. Bucket boundaries (in seconds): 0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0.
+ - **Alarm**: None for now. Need more experience with this metric first.
+
 ### tx-sender
 
 #### Metric Name: `kms_connector_tx_sender_response_received_counter`
@@ -336,4 +333,11 @@ Metrics for zkproof-worker are to be added in future releases, if/when needed. C
  - **Labels**:
    - `response_type`: see [description](#metric-name-kms_connector_tx_sender_response_received_counter) (only available for decryption right now!)
  - **Description**: Tracks the number of KMS responses not yet sent to the Gateway in the kms-connector's DB.
+ - **Alarm**: Need more experience with this metric first.
+
+#### Metric Name: `kms_connector_tx_sender_response_forwarding_latency_seconds`
+ - **Type**: Histogram
+ - **Labels**:
+   - `response_type`: see [description](#metric-name-kms_connector_tx_sender_response_received_counter)
+ - **Description**: Measures the latency from response creation in DB to successful blockchain transaction confirmation. Bucket boundaries (in seconds): 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 30.0.
  - **Alarm**: Need more experience with this metric first.

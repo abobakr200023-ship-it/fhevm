@@ -1,10 +1,10 @@
-use crate::types::decode_request_id;
+use crate::types::request_id_to_u256;
 use alloy::primitives::U256;
 use anyhow::anyhow;
 use kms_grpc::kms::v1::{
-    CrsGenRequest, CrsGenResult, InitRequest, InitiateResharingRequest, KeyGenPreprocRequest,
-    KeyGenPreprocResult, KeyGenRequest, KeyGenResult, PublicDecryptionRequest,
-    PublicDecryptionResponse, RequestId, UserDecryptionRequest, UserDecryptionResponse,
+    CrsGenRequest, CrsGenResult, KeyGenPreprocRequest, KeyGenPreprocResult, KeyGenRequest,
+    KeyGenResult, PublicDecryptionRequest, PublicDecryptionResponse, RequestId,
+    UserDecryptionRequest, UserDecryptionResponse,
 };
 use tonic::Response;
 
@@ -16,8 +16,6 @@ pub enum KmsGrpcRequest {
     PrepKeygen(KeyGenPreprocRequest),
     Keygen(KeyGenRequest),
     Crsgen(CrsGenRequest),
-    PrssInit(InitRequest),
-    KeyReshareSameSet(InitiateResharingRequest),
 }
 
 impl From<PublicDecryptionRequest> for KmsGrpcRequest {
@@ -55,7 +53,7 @@ impl TryFrom<(RequestId, Response<PublicDecryptionResponse>)> for KmsGrpcRespons
     fn try_from(
         value: (RequestId, Response<PublicDecryptionResponse>),
     ) -> Result<Self, Self::Error> {
-        let decryption_id = decode_request_id(value.0)
+        let decryption_id = request_id_to_u256(value.0)
             .map_err(|e| anyhow!("Failed to parse decryption_id: {e}"))?;
 
         Ok(Self::PublicDecryption {
@@ -69,7 +67,7 @@ impl TryFrom<(RequestId, Response<UserDecryptionResponse>)> for KmsGrpcResponse 
     type Error = anyhow::Error;
 
     fn try_from(value: (RequestId, Response<UserDecryptionResponse>)) -> Result<Self, Self::Error> {
-        let decryption_id = decode_request_id(value.0)
+        let decryption_id = request_id_to_u256(value.0)
             .map_err(|e| anyhow!("Failed to parse decryption_id: {e}"))?;
 
         Ok(Self::UserDecryption {

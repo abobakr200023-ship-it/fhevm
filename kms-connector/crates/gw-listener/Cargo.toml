@@ -10,6 +10,7 @@ version.workspace = true
 bc2wrap.workspace = true
 connector-utils.workspace = true
 fhevm_gateway_bindings.workspace = true
+fhevm_host_bindings.workspace = true
 
 actix-web.workspace = true
 alloy.workspace = true
@@ -25,6 +26,7 @@ tokio-util.workspace = true
 tracing.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 connector-utils = { workspace = true, features = ["tests"] }

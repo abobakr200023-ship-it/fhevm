@@ -28,6 +28,7 @@ axum = { workspace = true }
 tower-http = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+thiserror = { workspace = true }
 humantime = { workspace = true }
 
 # crates.io dependencies
@@ -46,3 +47,6 @@ rstest = "0.25.0"
 serial_test = { workspace = true }
 testcontainers = { workspace = true }
 test-harness = { path = "../test-harness" }
+
+[lints]
+workspace = true

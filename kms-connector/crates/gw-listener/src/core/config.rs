@@ -1,4 +1,4 @@
-use alloy::transports::http::reqwest::Url;
+use alloy::{primitives::Address, transports::http::reqwest::Url};
 use connector_utils::{
     config::{
         ContractConfig, DeserializeConfig,
@@ -35,6 +35,13 @@ pub struct Config {
     #[serde(deserialize_with = "deserialize_kms_generation_contract_config")]
     pub kms_generation_contract: ContractConfig,
 
+    /// The Ethereum RPC node endpoint.
+    pub ethereum_url: Url,
+    /// The Chain ID of the Ethereum chain.
+    pub ethereum_chain_id: u64,
+    /// The address of the `KMSVerifier` contract.
+    pub kms_verifier_address: Address,
+
     /// The service name used for tracing.
     #[serde(default = "default_service_name")]
     pub service_name: String,
@@ -55,6 +62,14 @@ pub struct Config {
     #[serde(with = "humantime_serde", default = "default_key_management_polling")]
     pub key_management_polling: Duration,
 
+    /// The maximum number of blocks to fetch per `eth_getLogs` request.
+    #[serde(default = "default_get_logs_batch_size")]
+    pub get_logs_batch_size: u64,
+
+    /// Maximum number of consecutive polling errors before stopping the loop.
+    #[serde(default = "default_max_consecutive_polling_errors")]
+    pub max_consecutive_polling_errors: usize,
+
     /// Optional block number to start processing decryption events from.
     pub decryption_from_block_number: Option<u64>,
     /// Optional block number to start processing KMS operation events from.
@@ -68,11 +83,19 @@ fn default_service_name() -> String {
 }
 
 fn default_decryption_polling() -> Duration {
-    Duration::from_secs(1)
+    Duration::from_millis(500)
 }
 
 fn default_key_management_polling() -> Duration {
     Duration::from_secs(30)
+}
+
+fn default_get_logs_batch_size() -> u64 {
+    100
+}
+
+fn default_max_consecutive_polling_errors() -> usize {
+    20
 }
 
 // Default implementation for testing purpose
@@ -83,6 +106,9 @@ impl Default for Config {
             database_pool_size: default_database_pool_size(),
             gateway_url: Url::from_str("http://localhost:8545").unwrap(),
             gateway_chain_id: 54321,
+            ethereum_url: Url::from_str("http://localhost:8545").unwrap(),
+            ethereum_chain_id: 11155111,
+            kms_verifier_address: Address::default(),
             decryption_contract: default_decryption_contract_config(),
             kms_generation_contract: default_kms_generation_contract_config(),
             service_name: default_service_name(),
@@ -91,6 +117,8 @@ impl Default for Config {
             healthcheck_timeout: default_healthcheck_timeout(),
             decryption_polling: default_decryption_polling(),
             key_management_polling: default_key_management_polling(),
+            get_logs_batch_size: default_get_logs_batch_size(),
+            max_consecutive_polling_errors: default_max_consecutive_polling_errors(),
             decryption_from_block_number: None,
             kms_operation_from_block_number: None,
         }
@@ -109,9 +137,14 @@ mod tests {
             env::remove_var("KMS_CONNECTOR_DATABASE_URL");
             env::remove_var("KMS_CONNECTOR_GATEWAY_URL");
             env::remove_var("KMS_CONNECTOR_GATEWAY_CHAIN_ID");
+            env::remove_var("KMS_CONNECTOR_ETHEREUM_URL");
+            env::remove_var("KMS_CONNECTOR_ETHEREUM_CHAIN_ID");
+            env::remove_var("KMS_CONNECTOR_KMS_VERIFIER_ADDRESS");
             env::remove_var("KMS_CONNECTOR_DECRYPTION_CONTRACT__ADDRESS");
             env::remove_var("KMS_CONNECTOR_KMS_GENERATION_CONTRACT__ADDRESS");
             env::remove_var("KMS_CONNECTOR_SERVICE_NAME");
+            env::remove_var("KMS_CONNECTOR_GET_LOGS_BATCH_SIZE");
+            env::remove_var("KMS_CONNECTOR_MAX_CONSECUTIVE_POLLING_ERRORS");
         }
     }
 
@@ -137,6 +170,12 @@ mod tests {
             );
             env::set_var("KMS_CONNECTOR_GATEWAY_URL", "http://localhost:9545");
             env::set_var("KMS_CONNECTOR_GATEWAY_CHAIN_ID", "31888");
+            env::set_var("KMS_CONNECTOR_ETHEREUM_URL", "http://localhost:9545");
+            env::set_var("KMS_CONNECTOR_ETHEREUM_CHAIN_ID", "31444");
+            env::set_var(
+                "KMS_CONNECTOR_KMS_VERIFIER_ADDRESS",
+                "0x0000000000000000000000000000000000000001",
+            );
             env::set_var(
                 "KMS_CONNECTOR_DECRYPTION_CONTRACT__ADDRESS",
                 "0x5fbdb2315678afecb367f032d93f642f64180aa3",
@@ -165,6 +204,15 @@ mod tests {
             config.kms_generation_contract.address,
             address!("0x0000000000000000000000000000000000000002")
         );
+        assert_eq!(
+            config.ethereum_url,
+            Url::from_str("http://localhost:9545").unwrap()
+        );
+        assert_eq!(config.ethereum_chain_id, 31444);
+        assert_eq!(
+            config.kms_verifier_address,
+            address!("0x0000000000000000000000000000000000000001")
+        );
         assert_eq!(config.service_name, "kms-connector-test");
 
         cleanup_env_vars();
@@ -179,15 +227,27 @@ mod tests {
         // Set an environment variable to override the file
         let gateway_chain_id = 77737;
         let service_name = "kms-connector-override";
+        let get_logs_batch_size: u64 = 500;
+        let max_consecutive_polling_errors = 5;
         let mut expected_config = example_config.clone();
         expected_config.gateway_chain_id = gateway_chain_id;
         expected_config.service_name = service_name.to_string();
+        expected_config.get_logs_batch_size = get_logs_batch_size;
+        expected_config.max_consecutive_polling_errors = max_consecutive_polling_errors;
         unsafe {
             env::set_var(
                 "KMS_CONNECTOR_GATEWAY_CHAIN_ID",
                 gateway_chain_id.to_string(),
             );
             env::set_var("KMS_CONNECTOR_SERVICE_NAME", service_name);
+            env::set_var(
+                "KMS_CONNECTOR_GET_LOGS_BATCH_SIZE",
+                get_logs_batch_size.to_string(),
+            );
+            env::set_var(
+                "KMS_CONNECTOR_MAX_CONSECUTIVE_POLLING_ERRORS",
+                max_consecutive_polling_errors.to_string(),
+            );
         }
 
         // Load config from both sources

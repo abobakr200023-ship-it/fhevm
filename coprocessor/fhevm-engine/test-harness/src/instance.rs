@@ -1,9 +1,9 @@
 use std::sync::Arc;
 
-use crate::db_utils::setup_test_user;
+use crate::db_utils::setup_test_key;
 use fhevm_engine_common::utils::DatabaseURL;
-use sqlx::postgres::types::Oid;
-use sqlx::Row;
+use sqlx::postgres::PgConnectOptions;
+use sqlx::ConnectOptions;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -55,6 +55,24 @@ pub async fn setup_test_db(mode: ImportMode) -> Result<DBInstance, Box<dyn std::
     }
 }
 
+fn connect_options(db_url: &str) -> PgConnectOptions {
+    db_url.parse().expect("database URL should be valid")
+}
+
+fn extract_db_name(db_url: &str) -> String {
+    connect_options(db_url)
+        .get_database()
+        .expect("database URL must contain a database name")
+        .to_owned()
+}
+
+fn admin_url_from(db_url: &str) -> String {
+    connect_options(db_url)
+        .database("postgres")
+        .to_url_lossy()
+        .to_string()
+}
+
 async fn setup_test_app_existing_localhost(
     with_reset: bool,
     mode: ImportMode,
@@ -63,13 +81,13 @@ async fn setup_test_app_existing_localhost(
 
     if with_reset {
         info!("Resetting local database at {db_url}");
-        let admin_db_url = db_url.to_string().replace("coprocessor", "postgres");
+        let admin_db_url = admin_url_from(db_url.as_str());
         create_database(&admin_db_url, db_url.as_str(), mode).await?;
     }
 
     info!("Using existing local database at {db_url}");
 
-    let _ = get_sns_pk_size(&sqlx::PgPool::connect(db_url.as_str()).await?, 12345).await;
+    let _ = get_sns_pk_size(&sqlx::PgPool::connect(db_url.as_str()).await?).await;
 
     Ok(DBInstance {
         _container: None,
@@ -78,10 +96,13 @@ async fn setup_test_app_existing_localhost(
     })
 }
 
+const POSTGRES_PORT: u16 = 5432;
+
 async fn setup_test_app_custom_docker(
     mode: ImportMode,
 ) -> Result<DBInstance, Box<dyn std::error::Error>> {
     let container = GenericImage::new("postgres", "15.7")
+        .with_exposed_port(POSTGRES_PORT.into())
         .with_wait_for(WaitFor::message_on_stderr(
             "database system is ready to accept connections",
         ))
@@ -94,10 +115,10 @@ async fn setup_test_app_custom_docker(
     info!("Postgres container started");
 
     let cont_host = container.get_host().await?;
-    let cont_port = container.get_host_port_ipv4(5432).await?;
+    let cont_port = container.get_host_port_ipv4(POSTGRES_PORT).await?;
 
-    let admin_db_url = format!("postgresql://postgres:postgres@{cont_host}:{cont_port}/postgres");
     let db_url = format!("postgresql://postgres:postgres@{cont_host}:{cont_port}/coprocessor");
+    let admin_db_url = admin_url_from(&db_url);
     create_database(&admin_db_url, &db_url, mode).await?;
 
     Ok(DBInstance {
@@ -111,6 +132,7 @@ pub enum ImportMode {
     None,
     WithKeysNoSns,
     WithAllKeys,
+    SkipMigrations,
 }
 
 async fn create_database(
@@ -118,17 +140,18 @@ async fn create_database(
     db_url: &str,
     mode: ImportMode,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    info!("Creating coprocessor db...");
+    let db_name = extract_db_name(db_url);
+    info!(db_name, "Creating database...");
     let admin_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
         .connect(admin_db_url)
         .await?;
 
-    sqlx::query!("DROP DATABASE IF EXISTS coprocessor;")
+    sqlx::query(&format!("DROP DATABASE IF EXISTS \"{db_name}\""))
         .execute(&admin_pool)
         .await?;
 
-    sqlx::query!("CREATE DATABASE coprocessor;")
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\""))
         .execute(&admin_pool)
         .await?;
 
@@ -138,20 +161,23 @@ async fn create_database(
         .connect(db_url)
         .await?;
 
-    info!("Running migrations...");
-    sqlx::migrate!("./migrations").run(&pool).await?;
-
     match mode {
+        ImportMode::SkipMigrations => {
+            info!("Skipping migrations");
+        }
         ImportMode::None => {
+            sqlx::migrate!("./migrations").run(&pool).await?;
             info!("No keys imported");
         }
         ImportMode::WithKeysNoSns => {
-            info!("Creating test user with keys, without SnS key...");
-            setup_test_user(&pool, false).await?;
+            sqlx::migrate!("./migrations").run(&pool).await?;
+            info!("Creating test keys, without SnS key...");
+            setup_test_key(&pool, false).await?;
         }
         ImportMode::WithAllKeys => {
-            info!("Creating test user with all keys...");
-            setup_test_user(&pool, true).await?;
+            sqlx::migrate!("./migrations").run(&pool).await?;
+            info!("Creating test keys with all keys...");
+            setup_test_key(&pool, true).await?;
         }
     }
 
@@ -160,18 +186,38 @@ async fn create_database(
     Ok(())
 }
 
-pub async fn get_sns_pk_size(pool: &sqlx::PgPool, chain_id: i64) -> Result<i64, sqlx::Error> {
-    let row = sqlx::query("SELECT sns_pk FROM tenants WHERE chain_id = $1")
-        .bind(chain_id)
-        .fetch_one(pool)
-        .await?;
-
-    let oid: Oid = row.try_get(0)?;
-    info!(oid = ?oid, chain_id, "Found sns_pk oid");
-    let row = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(octet_length(data))::bigint, 0) FROM pg_largeobject WHERE loid = $1",
+pub async fn get_sns_pk_size(pool: &sqlx::PgPool) -> Result<i64, sqlx::Error> {
+    // Two storage shapes coexist: compressed_xof_keyset is BYTEA
+    // (size = octet_length), sns_pk is an OID pointing at a
+    // large-object (size = SUM(octet_length(data))). Prefer the
+    // compressed column, fall back to the legacy LOB.
+    let row = sqlx::query!(
+        r#"SELECT octet_length(compressed_xof_keyset)::bigint AS "compressed_size?",
+                  sns_pk AS "sns_pk_oid?"
+           FROM keys ORDER BY sequence_number DESC LIMIT 1"#,
     )
-    .bind(oid)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        info!("No keys row found");
+        return Ok(0);
+    };
+
+    if let Some(size) = row.compressed_size {
+        info!(size = ?bytesize::ByteSize::b(size as u64), "Found compressed_xof_keyset BYTEA");
+        return Ok(size);
+    }
+
+    let Some(oid) = row.sns_pk_oid else {
+        info!("No sns_pk found in keys");
+        return Ok(0);
+    };
+    info!(oid = ?oid, "Found sns_pk oid");
+    let row = sqlx::query_scalar!(
+        r#"SELECT COALESCE(SUM(octet_length(data))::bigint, 0) AS "size!" FROM pg_largeobject WHERE loid = $1"#,
+        oid
+    )
     .fetch_one(pool)
     .await?;
 

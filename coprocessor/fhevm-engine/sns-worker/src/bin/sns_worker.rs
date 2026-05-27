@@ -1,5 +1,7 @@
 use sns_worker::{Config, DBConfig, HealthCheckConfig, S3Config, S3RetryPolicy, SNSMetricsConfig};
 
+use fhevm_engine_common::database::resolve_database_url_from_option;
+use fhevm_engine_common::telemetry;
 use tokio::signal::unix;
 use tokio_util::sync::CancellationToken;
 use tracing::error;
@@ -13,13 +15,12 @@ fn handle_sigint(token: CancellationToken) {
     });
 }
 
-fn construct_config() -> Config {
+fn construct_config() -> Result<Config, fhevm_engine_common::database::DatabaseConnectionError> {
     let args: utils::daemon_cli::Args = utils::daemon_cli::parse_args();
 
-    let db_url = args.database_url.clone().unwrap_or_default();
+    let db_url = resolve_database_url_from_option(args.database_url.clone())?;
 
-    Config {
-        tenant_api_key: args.tenant_api_key,
+    Ok(Config {
         service_name: args.service_name,
         metrics: SNSMetricsConfig {
             addr: args.metrics_addr,
@@ -57,22 +58,22 @@ fn construct_config() -> Config {
         enable_compression: args.enable_compression,
         schedule_policy: args.schedule_policy,
         pg_auto_explain_with_min_duration: args.pg_auto_explain_with_min_duration,
-    }
+    })
 }
 
 #[tokio::main]
 async fn main() {
-    let config: Config = construct_config();
+    let config: Config = construct_config().unwrap_or_else(|err| {
+        error!(error = %err, "Invalid database configuration");
+        std::process::exit(1);
+    });
     let parent = CancellationToken::new();
 
-    tracing_subscriber::fmt()
-        .json()
-        .with_target(false) // drop "target" field so the logs are not too verbose. Instead, span names are used.
-        .with_current_span(true) // keep "span"
-        .with_span_list(false) // drop "spans"
-        .with_level(true)
-        .with_max_level(config.log_level)
-        .init();
+    let _otel_guard = telemetry::init_tracing_otel_with_logs_only_fallback(
+        config.log_level,
+        &config.service_name,
+        "otlp-layer",
+    );
 
     // Handle SIGINIT signals
     handle_sigint(parent.clone());
